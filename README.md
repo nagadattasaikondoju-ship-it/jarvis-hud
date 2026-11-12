@@ -13,6 +13,7 @@ The interface is hosted on Vercel. The AI runs on your computer. Your conversati
 ![Vercel](https://img.shields.io/badge/Hosted%20on-Vercel-000?logo=vercel)
 ![Ollama](https://img.shields.io/badge/Local%20AI-Ollama-white)
 ![OpenJarvis](https://img.shields.io/badge/Built%20on-OpenJarvis-3fe0ff)
+![License: MIT](https://img.shields.io/badge/License-MIT-green)
 
 <img src="docs/screenshots/conversation.png" alt="OpenJarvis HUD answering a question, with the holographic core, telemetry panels and command protocols" width="100%">
 
@@ -39,7 +40,8 @@ The interface is hosted on Vercel. The AI runs on your computer. Your conversati
 15. [Deployment](#-deployment)
 16. [Roadmap](#-roadmap)
 17. [FAQ](#-faq)
-18. [Credits & disclaimer](#-credits--disclaimer)
+18. [License](#-license)
+19. [Credits & disclaimer](#-credits--disclaimer)
 
 ---
 
@@ -456,6 +458,12 @@ The AI does, but the page itself must first load from Vercel. The browser usuall
 
 **Why "Ollama direct" and "OpenJarvis" modes?**
 Ollama direct is the light setup. OpenJarvis adds agents, tools, memory and energy and cost telemetry, at the price of a larger install.
+
+---
+
+## 📄 License
+
+Released under the [MIT License](LICENSE) © 2026 Naga Datta. OpenJarvis and Ollama keep their own licences.
 
 ---
 
