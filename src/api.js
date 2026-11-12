@@ -4,7 +4,7 @@
 //   ollama     -> Ollama directly (:11434), no agent layer
 
 export const DEFAULTS = {
-  mode: 'openjarvis',
+  mode: 'ollama',
   endpoint: 'http://localhost:8000',
   ollamaEndpoint: 'http://localhost:11434',
   apiKey: '',
@@ -14,6 +14,9 @@ export const DEFAULTS = {
   voiceReply: true,
   voiceName: '',
   historyTurns: 12,
+  maxCtx: 16384,
+  useMemory: true,
+  companionUrl: 'http://127.0.0.1:8765',
 };
 
 const trim = (u) => (u || '').replace(/\/+$/, '');
@@ -105,19 +108,25 @@ export function splitThinking(raw) {
  * Stream a chat completion. Calls onDelta({content, reasoning}) per chunk.
  * Resolves with { usage: {completion_tokens, prompt_tokens} | null }.
  */
-export async function streamChat(cfg, messages, model, onDelta, signal, onEvent) {
-  const isOllama = cfg.mode === 'ollama';
-  const url = baseUrl(cfg) + (isOllama ? '/api/chat' : '/v1/chat/completions');
+export async function streamChat(cfg, messages, model, onDelta, signal, onEvent, extra = {}) {
+  // Images, structured output and big documents always go straight to Ollama.
+  const isOllama = cfg.mode === 'ollama' || extra.forceOllama;
+  const target = isOllama ? { ...cfg, mode: 'ollama' } : cfg;
+  const url = baseUrl(target) + (isOllama ? '/api/chat' : '/v1/chat/completions');
+  const options = {};
+  if (extra.numCtx) options.num_ctx = extra.numCtx;
+  if (extra.numPredict) options.num_predict = extra.numPredict;
+  if (extra.temperature != null) options.temperature = extra.temperature;
   const body = isOllama
-    ? { model, messages, stream: true, think: false }
-    : { model: model || undefined, messages, stream: true };
+    ? { model, messages, stream: true, think: false, ...(extra.format ? { format: extra.format } : {}), ...(Object.keys(options).length ? { options } : {}) }
+    : { model: model || undefined, messages: messages.map(({ images, ...m }) => m), stream: true };
 
   let r;
   try {
-    r = await fetch(url, { method: 'POST', headers: headers(cfg, true), body: JSON.stringify(body), signal });
+    r = await fetch(url, { method: 'POST', headers: headers(target, true), body: JSON.stringify(body), signal });
   } catch (e) {
     if (e?.name === 'AbortError') throw e;
-    throw new Error(describeError(e, cfg));
+    throw new Error(describeError(e, target));
   }
   if (!r.ok) {
     let detail = '';

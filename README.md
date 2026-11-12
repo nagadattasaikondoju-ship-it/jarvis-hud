@@ -29,7 +29,8 @@ The interface is hosted on Vercel. The AI runs on your computer. Your conversati
 4. [How it works](#-how-it-works)
 5. [Quick start for users (Windows)](#-quick-start-for-users-windows)
 6. [Quick start for users (macOS / Linux)](#-quick-start-for-users-macos--linux)
-7. [Connection modes: Ollama direct vs OpenJarvis](#-connection-modes)
+7. [Jarvis Companion: web research + scheduled tasks](#️-jarvis-companion-web-research--scheduled-tasks)
+8. [Connection modes: Ollama direct vs OpenJarvis](#-connection-modes)
 8. [Using the HUD](#-using-the-hud)
 9. [Troubleshooting](#-troubleshooting)
 10. [Privacy & security](#-privacy--security)
@@ -62,6 +63,19 @@ Most AI assistants send everything you type to a company's servers. This one doe
 | | Feature | Details |
 |---|---|---|
 | 🌀 | **Reactive holographic core** | Six rotating instrument rings whose speed and colour follow Jarvis's state: **Standby**, **Listening**, **Processing**, **Responding**, **Offline** |
+| 🗂️ | **Projects** | Group chats, custom instructions and reference files into projects such as "Startup pitch" or "College notes"; Jarvis reads them automatically |
+| 🧠 | **Memory** | Say *"remember that I prefer short answers"*; saved facts are added to every reply, and you can view or delete them any time |
+| 💬 | **Multiple chats** | Unlimited chats per project, saved in your browser's IndexedDB |
+| 📄 | **Document analysis** | Attach or drag in **PDF, Word (.docx), Excel (.xlsx), CSV, text and code** files; text is extracted in your browser and summarised, queried or compared |
+| 🖼️ | **Image & chart analysis** | Attach or paste screenshots, photos and charts; the local vision model (`qwen3.5:2b` supports images) describes and reads them |
+| ✍️ | **Writing mode** | Emails, articles, stories, reports, posts, letters and speeches in 9 tones and 3 lengths |
+| 🌍 | **Translation mode** | 21 languages including Telugu, Hindi, Tamil, Kannada, Malayalam, Marathi, Bengali, Spanish, French, German, Arabic, Chinese and Japanese |
+| 📁 | **Office file creation** | Ask for a **Word, PowerPoint, Excel or PDF** file and download a real formatted file, built in your browser; any answer can also be exported to .docx or .pdf |
+| 📊 | **Dashboards** | Turn a spreadsheet, CSV or pasted numbers into KPI cards and live charts; open full screen or download as a standalone HTML file |
+| ◳ | **Artifacts** | Diagrams, calculators and mini web apps generated as HTML and run in a sandboxed preview |
+| 🌐 | **Web research with citations** | Through **Jarvis Companion** and your own free Tavily or Brave key: numbered sources, inline [1] citations and a source list |
+| ⏰ | **Background scheduled tasks** | Through **Jarvis Companion**, e.g. *"every weekday at 8:00, brief me on tech news"*; runs even with the browser closed, and results land in an inbox |
+| 🎙️ | **Conversation mode** | Hands-free voice loop: Jarvis listens, answers aloud, then listens again; say "stop" to end |
 | 💬 | **Streaming chat** | Replies appear word by word as they're generated, rendered as formatted Markdown (lists, code, tables, links) and sanitised against injected HTML |
 | 🎤 | **Voice input** | Click the mic and speak; the transcript fills in live and sends when you stop talking |
 | 🔊 | **Spoken replies** | Jarvis reads answers aloud using your system's voices, preferring a British English voice; you can choose any voice |
@@ -90,9 +104,15 @@ Most AI assistants send everything you type to a company's servers. This one doe
 |---|---|
 | <img src="docs/screenshots/setup.png" alt="Setup panel with copy-paste install commands"> | <img src="docs/screenshots/config.png" alt="Link settings: mode, endpoint, model"> |
 
+| Dashboard from a CSV | Artifact (live mini app) | Web research with citations |
+|---|---|---|
+| <img src="docs/screenshots/dashboard.png" alt="Dashboard with KPI cards, doughnut and bar charts"> | <img src="docs/screenshots/artifact.png" alt="Tip calculator artifact running in a sandbox"> | <img src="docs/screenshots/research.png" alt="Research answer with numbered sources and the workspace sidebar"> |
+
+<sub>The feature screenshots above use example data.</sub>
+
 | Boot sequence | Offline state | Mobile |
 |---|---|---|
-| <img src="docs/screenshots/boot.png" alt="Boot sequence"> | <img src="docs/screenshots/offline.png" alt="Offline: the core turns amber and SETUP pulses"> | <img src="docs/screenshots/mobile.png" alt="Phone layout" width="260"> |
+| <img src="docs/screenshots/boot.png" alt="Boot sequence"> | <img src="docs/screenshots/offline.png" alt="Offline: the core turns amber and SETUP pulses"> | <img src="docs/screenshots/mobile.png" alt="Phone layout" width="200"> <img src="docs/screenshots/mobile-workspace.png" alt="Phone workspace drawer" width="200"> |
 
 ---
 
@@ -201,6 +221,57 @@ OPENJARVIS_CORS_ORIGINS=https://openjarvis-hud.vercel.app jarvis serve --port 80
 
 ---
 
+## 🛰️ Jarvis Companion (web research + scheduled tasks)
+
+Two features can't work inside a browser tab alone:
+
+- **Searching the web.** Search APIs block direct browser calls, and your API key must stay private.
+- **Running tasks when the browser is closed.**
+
+**Jarvis Companion** is a ~20 KB Python program (standard library only, no `pip install`) that runs quietly on your PC at `http://127.0.0.1:8765`.
+
+### Install (Windows, no admin)
+```powershell
+irm https://openjarvis-hud.vercel.app/companion/install.ps1 | iex
+```
+The installer:
+1. Finds Python, or installs Python 3.13 with winget.
+2. Saves the program to `%LOCALAPPDATA%\JarvisCompanion`.
+3. Adds a **Startup** shortcut, so it starts every time you sign in.
+4. Starts it, and checks that it answers.
+
+macOS / Linux:
+```bash
+curl -fsSL https://openjarvis-hud.vercel.app/companion/jarvis_companion.py -o ~/jarvis_companion.py && python3 ~/jarvis_companion.py
+```
+
+### Add your free search key
+1. Create a free key at [Tavily](https://app.tavily.com) (recommended, built for AI) or the [Brave Search API](https://api-dashboard.search.brave.com).
+2. In the HUD, go to **SETUP → COMPANION**, paste the key, and click **SAVE KEY & TEST**.
+
+The key is stored only in `%LOCALAPPDATA%\JarvisCompanion\config.json` on your PC.
+
+### What it does
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Status, version, whether a search key is saved |
+| `POST /config` | Save search provider/key, model, persona and memory (used by scheduled tasks) |
+| `POST /search` | Web search through Tavily or Brave; returns titles, URLs and text snippets |
+| `GET/POST /tasks`, `DELETE /tasks/{id}` | Create, edit and delete scheduled tasks (daily, chosen weekdays, hourly, every N minutes) |
+| `POST /tasks/{id}/run` | Run a task now |
+| `GET /runs`, `POST /runs/{id}/read` | Results inbox |
+
+Scheduled tasks call your local Ollama model, optionally after a web search. Results are stored in a local SQLite database, `jarvis.db`. If the PC was off at the scheduled time, the task runs once when the Companion next starts.
+
+**Security:**
+- It listens on `127.0.0.1` only.
+- It answers only the HUD's own web address (CORS) and requests carrying an `X-Jarvis` header, so other websites can't use it.
+- Logs are kept in `companion.log`.
+
+**Uninstall:** press Win + R, type `shell:startup`, and delete **Jarvis Companion**. Then delete `%LOCALAPPDATA%\JarvisCompanion`.
+
+---
+
 ## 🔀 Connection modes
 
 | | **Ollama direct** | **OpenJarvis server** |
@@ -235,6 +306,25 @@ Switch modes any time in **CONFIG → Link**.
 | PROCESSING | Blue, fast spin | Waiting for the first words; shows tool activity such as `TOOL · WEB_SEARCH` |
 | RESPONDING | Cyan, fast | Streaming or speaking a reply |
 | LINK OFFLINE / HANDSHAKE | Amber, flicker | Can't reach your local AI |
+
+### Modes (the chips above the message box)
+| Mode | What to type | What you get |
+|---|---|---|
+| CHAT | Anything | A normal conversation; attach files or images to ask about them |
+| WRITE | "A polite email asking for Friday off" | A finished piece in the chosen type, tone and length |
+| TRANSLATE | Paste text | The translation, plus notes on tricky words |
+| CREATE FILE | "A 6-slide deck about…" (+ optional attachments) | A downloadable .docx, .pptx, .xlsx or .pdf |
+| DASHBOARD | Attach a CSV or Excel file, or paste numbers | KPI cards and charts, full screen, downloadable as HTML |
+| ARTIFACT | "A tip calculator", "a flowchart of…" | A live mini app or diagram in a sandbox |
+| RESEARCH | A question about current events | A cited answer from web sources (needs the Companion and a search key) |
+
+### Workspace (left column)
+- **Projects:** choose or create one. Add instructions and reference files; every chat in the project uses them.
+- **Chats:** start a new chat, switch between chats, or delete one.
+- **Memory:** add or remove facts. Turn "Use memory in replies" off to pause it.
+
+### Files
+Click the **paperclip**, drag files onto the conversation, or paste an image. Supported: PDF, DOCX, XLSX/XLSM, CSV/TSV, TXT/MD/JSON/HTML/code, and images. Large files are trimmed to fit **CONFIG → Max context**; raise it for long documents if your PC has enough RAM.
 
 ### Keyboard shortcuts
 | Key | Action |
@@ -276,6 +366,11 @@ Switch modes any time in **CONFIG → Link**.
 | `MSVC build tools not found` (OpenJarvis install) | Missing C++ linker | Install the Build Tools (see the full Windows setup), then re-run the installer |
 | `jarvis is not recognized` | PATH not refreshed | Close PowerShell and open a new one |
 | Mic says "not supported" | The browser lacks the Web Speech API | Use Chrome or Edge |
+| COMPANION pill is grey | The Companion isn't running | Run the installer again, or start it from the Startup shortcut; check `%LOCALAPPDATA%\\JarvisCompanion\\companion.log` |
+| Research says "Add your search API key" | No key saved | **SETUP → COMPANION**: paste your Tavily or Brave key |
+| File or dashboard says "incomplete result" | The small model ran out of room or lost track | Try again with a shorter request, or raise **Max context** |
+| A PDF shows no text | It's a scanned image | Take a screenshot of the page and attach it as an image instead |
+| Non-English text looks broken in exported PDFs | PDF export uses standard fonts | Export to **Word (.docx)** for Telugu, Hindi and other scripts |
 
 Quick health checks:
 ```powershell
@@ -293,6 +388,9 @@ ollama ps                                        # loaded models, and CPU vs GPU
 - **Voice input:** Chrome and Edge send microphone audio to their speech service (Google or Microsoft) for transcription. Typed messages stay local.
 - **Spoken replies** use voices installed on your device.
 - **Web search (OpenJarvis mode):** when the agent searches, the search query goes to a web search provider. The AI model itself stays local.
+- **Chats, projects, attached files and memory** are stored in your browser's IndexedDB on this computer.
+- **Jarvis Companion** keeps your search key, tasks and results in `%LOCALAPPDATA%\\JarvisCompanion`. Only your search words are sent to the search provider.
+- **Artifacts** run in a sandboxed iframe without access to the HUD, your storage or your files.
 - **CORS is your gatekeeper.** Only allow the exact HUD address, never `*`, so other websites can't use your local AI.
 - **Don't expose Ollama to the internet.** It has no authentication, so keep it bound to `localhost`.
 - Markdown output is sanitised with **DOMPurify** before rendering.
@@ -331,6 +429,11 @@ OLLAMA_ORIGINS=http://localhost:5173 ollama serve
 | UI | React 18 | Component model; streaming state updates |
 | Build | Vite 6 | Fast dev server; small static output (~80 KB gzipped JS) |
 | Markdown | `marked` + `DOMPurify` | Rich replies, safely rendered |
+| File reading | `pdfjs-dist`, `mammoth`, `exceljs` | Extract PDF, Word and Excel text in the browser |
+| File creation | `docx`, `pptxgenjs`, `exceljs`, `jspdf` | Real Office/PDF files, no server |
+| Charts | `chart.js` | Dashboard charts |
+| Storage | IndexedDB | Chats, projects, files and memory |
+| Companion | Python 3 standard library + SQLite | Search proxy and background scheduler |
 | Visuals | Hand-written SVG + CSS animations + `<canvas>` waveform | No heavy graphics libraries; smooth on low-end devices |
 | Voice | Web Speech API (`SpeechRecognition`, `speechSynthesis`) | No server needed |
 | Fonts | Orbitron, Rajdhani, JetBrains Mono (Google Fonts) | Display, UI and data typography |
@@ -348,6 +451,9 @@ jarvis-hud/
 ├── package.json
 ├── public/
 │   └── favicon.svg
+├── public/companion/
+│   ├── jarvis_companion.py    # The Companion (Python stdlib)
+│   └── install.ps1            # One-line Windows installer
 ├── docs/
 │   └── screenshots/           # Images used in this README
 └── src/
@@ -355,7 +461,15 @@ jarvis-hud/
     ├── App.jsx                # Layout, state, link monitor, chat flow, voice
     ├── api.js                 # Link layer: probe, streaming chat, savings
     ├── styles.css             # Design tokens, HUD styling, animations, responsive
+    ├── store.js           # IndexedDB store: chats, projects, files, memory
+    ├── files.js           # In-browser PDF/DOCX/XLSX/CSV/image reading
+    ├── modes.js           # Mode prompts + JSON schemas for files/dashboards
+    ├── exporters.js       # Builds .docx / .pptx / .xlsx / .pdf in the browser
+    ├── companion.js       # Client for Jarvis Companion (search, tasks, inbox)
     └── components/
+        ├── Workspace.jsx      # Projects, chats, memory
+        ├── Scheduler.jsx      # Background tasks + results inbox
+        ├── ArtifactPanel.jsx  # Dashboards (Chart.js) + sandboxed HTML artifacts
         ├── Core.jsx           # Animated SVG core (state-driven)
         ├── Waveform.jsx       # Canvas audio/activity visualiser
         ├── Boot.jsx           # Start-up sequence
@@ -432,10 +546,14 @@ vercel --prod
 ## 🗺️ Roadmap
 
 - [ ] **Cloud mode**, so the link works for everyone without installing anything (server-side API key, login, daily limits)
-- [ ] User accounts and saved chat history across devices
+- [x] Projects, multiple chats and memory (in your browser)
+- [x] Document and image analysis, writing modes and translation
+- [x] Word / PowerPoint / Excel / PDF creation, dashboards and artifacts
+- [x] Web research with citations and background scheduled tasks (Jarvis Companion)
+- [x] Hands-free conversation mode
+- [ ] User accounts and chat history synced across devices
 - [ ] Wake word ("Hey Jarvis")
-- [ ] File and image input for vision models
-- [ ] Multiple conversations and threads
+- [ ] Fully offline speech recognition (Whisper in the browser)
 - [ ] One-click desktop app bundling Ollama + HUD
 - [ ] Own brand name and custom domain
 - [ ] Themes (classic cyan, amber, crimson)
