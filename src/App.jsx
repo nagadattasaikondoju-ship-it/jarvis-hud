@@ -464,7 +464,7 @@ export default function App() {
       <footer className="foot">
         <span>INFERENCE: LOCAL · {baseUrl(cfg).replace(/^https?:\/\//, '')}</span>
         <span>ENTER execute · SHIFT+ENTER newline · ESC interrupt</span>
-        <span>Built on <a href="https://github.com/open-jarvis/OpenJarvis" target="_blank" rel="noreferrer">OpenJarvis</a></span>
+        <span>Built on <a href="https://github.com/open-jarvis/OpenJarvis" target="_blank" rel="noreferrer">OpenJarvis</a> · <a href="https://github.com/nagadattasaikondoju-ship-it/jarvis-hud" target="_blank" rel="noreferrer">Source</a></span>
       </footer>
 
       <Settings
