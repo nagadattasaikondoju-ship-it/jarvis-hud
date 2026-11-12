@@ -7,6 +7,10 @@ Jarvis Companion - a small local helper for the OpenJarvis HUD.
     even when the browser is closed. Results wait in the HUD's inbox, and a
     desktop notification tells you when one is ready.
   * Live system vitals for the HUD (CPU, memory, battery, NVIDIA GPU).
+  * Optional add-ons, installed only when you click SET UP in the HUD:
+      - Folder search: indexes folders you choose, with a small local embedding model.
+      - Offline voice: Whisper speech recognition and Piper voices, all on this PC.
+  * A fixed list of safe PC actions (open an app or website, media keys, reminders, disk report).
 
 Standard library only (no pip installs). Listens on 127.0.0.1:8765 only, and
 only answers the HUD's own web address (CORS) plus requests carrying X-Jarvis.
@@ -30,8 +34,8 @@ from datetime import datetime, timedelta
 from xml.sax.saxutils import escape as xml_escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.1.0"
-FEATURES = ["search", "tasks", "system", "notify"]
+VERSION = "1.2.0"
+FEATURES = ["search", "tasks", "system", "notify", "folders", "actions", "voice"]
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("JARVIS_COMPANION_PORT", "8765"))
 ALLOWED_ORIGINS = {
@@ -59,6 +63,10 @@ DEFAULT_CFG = {
     "memory": [],
     "notify": True,
     "site_url": "https://openjarvis-hud.vercel.app",
+    "folders": [],
+    "stt_model": "small",
+    "stt_language": "",
+    "tts_voice": "en_GB-alan-medium",
 }
 IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
@@ -136,6 +144,13 @@ def init_db():
               id TEXT PRIMARY KEY, task_id TEXT, task_name TEXT, started REAL, finished REAL,
               status TEXT, output TEXT, sources TEXT, read INTEGER DEFAULT 0);
             CREATE INDEX IF NOT EXISTS runs_started ON runs(started);
+            CREATE TABLE IF NOT EXISTS docs (
+              id INTEGER PRIMARY KEY, folder TEXT, path TEXT UNIQUE, mtime REAL, size INTEGER,
+              chunks INTEGER, status TEXT, error TEXT);
+            CREATE TABLE IF NOT EXISTS chunks (
+              id INTEGER PRIMARY KEY, doc_id INTEGER, idx INTEGER, label TEXT, text TEXT, vec BLOB);
+            CREATE INDEX IF NOT EXISTS chunks_doc ON chunks(doc_id);
+            CREATE TABLE IF NOT EXISTS reminders (id TEXT PRIMARY KEY, at REAL, text TEXT, done INTEGER, created REAL);
             """
         )
 
@@ -557,10 +572,759 @@ def scheduler_loop():
                     con.execute("UPDATE tasks SET next_run=? WHERE id=?", (next_run(t["schedule"], now).timestamp(), t["id"]))
             for t in due:
                 threading.Thread(target=run_task, args=(t,), daemon=True).start()
+            due_reminders()
         except Exception:
             log("scheduler error", traceback.format_exc())
         time.sleep(20)
 
+
+# ------------------------------------------------------------ optional add-ons
+# Folder search and offline voice need a few extra Python packages and models.
+# They are installed only when the user clicks SET UP in the HUD, from this fixed list.
+EXTRAS = {
+    "folders": ["pypdf>=4,<8", "numpy>=1.24"],
+    "voice": ["faster-whisper>=1.1,<2", "piper-tts>=1.3,<2", "numpy>=1.24"],
+}
+EMBED_MODEL = "nomic-embed-text"
+WHISPER_FILES = ["config.json", "model.bin", "tokenizer.json", "vocabulary.txt"]
+WHISPER_SIZES = {"base": 145, "small": 480}  # MB, multilingual models
+VOICE_CATALOG = [
+    ("en_GB-alan-medium", "English (UK) · Alan, calm male"),
+    ("en_GB-northern_english_male-medium", "English (UK) · Northern male"),
+    ("en_GB-cori-medium", "English (UK) · Cori, female"),
+    ("en_US-ryan-medium", "English (US) · Ryan, male"),
+    ("en_US-lessac-medium", "English (US) · Lessac, female"),
+    ("te_IN-padmavathi-medium", "Telugu · Padmavathi, female"),
+    ("te_IN-maya-medium", "Telugu · Maya, female"),
+    ("hi_IN-pratham-medium", "Hindi · Pratham, male"),
+    ("hi_IN-priyamvada-medium", "Hindi · Priyamvada, female"),
+    ("ml_IN-arjun-medium", "Malayalam · Arjun, male"),
+]
+VOICE_IDS = {v for v, _ in VOICE_CATALOG}
+MODELS_DIR = os.path.join(HOME, "models")
+VOICES_DIR = os.path.join(HOME, "voices")
+JOBS = {}
+_jobs_lock = threading.Lock()
+
+
+def job_update(name, **kw):
+    with _jobs_lock:
+        JOBS.setdefault(name, {"state": "idle"}).update(kw)
+
+
+def python_cli():
+    """python.exe next to pythonw.exe (pip needs a console interpreter on Windows)."""
+    exe = sys.executable
+    if IS_WIN and exe.lower().endswith("pythonw.exe"):
+        cand = exe[:-len("pythonw.exe")] + "python.exe"
+        if os.path.exists(cand):
+            return cand
+    return exe
+
+
+def pip_install(pkgs):
+    cmd = [python_cli(), "-m", "pip", "install", "--disable-pip-version-check", "--no-warn-script-location", "--upgrade"]
+    if sys.prefix == getattr(sys, "base_prefix", sys.prefix):  # not inside a virtualenv
+        cmd.append("--user")
+    r = subprocess.run(cmd + list(pkgs), capture_output=True, text=True, timeout=1800, creationflags=NO_WINDOW)
+    if r.returncode != 0:
+        log("pip failed", r.stdout[-2000:], r.stderr[-2000:])
+        tail = (r.stderr or r.stdout).strip().splitlines()[-1:] or ["unknown error"]
+        raise RuntimeError("Installing packages failed: " + tail[0][:300])
+    # A user site-packages folder created just now is not on sys.path yet.
+    import importlib
+    import site
+    try:
+        site.addsitedir(site.getusersitepackages())
+    except Exception:
+        pass
+    importlib.invalidate_caches()
+
+
+def have(module):
+    import importlib.util
+    try:
+        return importlib.util.find_spec(module) is not None
+    except Exception:
+        return False
+
+
+def download(url, dest, job=None, label=""):
+    """Download to dest (via a .part file), reporting progress to a job."""
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        return
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    req = urllib.request.Request(url, headers={"User-Agent": "JarvisCompanion/" + VERSION})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        total = int(r.headers.get("Content-Length") or 0)
+        got = 0
+        with open(dest + ".part", "wb") as f:
+            while True:
+                b = r.read(1 << 16)
+                if not b:
+                    break
+                f.write(b)
+                got += len(b)
+                if job:
+                    job_update(job, detail=f"{label} · {got // 1_000_000} / {total // 1_000_000 or '?'} MB",
+                               progress=(got / total) if total else None)
+    os.replace(dest + ".part", dest)
+
+
+def ollama_pull(model, job):
+    cfg = load_cfg()
+    req = urllib.request.Request(cfg["ollama_url"].rstrip("/") + "/api/pull", data=json.dumps({"model": model, "stream": True}).encode(),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=3600) as r:
+        for line in r:
+            if not line.strip():
+                continue
+            j = json.loads(line)
+            if j.get("error"):
+                raise RuntimeError(j["error"])
+            if j.get("total"):
+                job_update(job, detail=f"AI search model · {j.get('completed', 0) // 1_000_000} / {j['total'] // 1_000_000} MB",
+                           progress=j.get("completed", 0) / j["total"])
+
+
+def ollama_has(model):
+    try:
+        tags = http_json(load_cfg()["ollama_url"].rstrip("/") + "/api/tags", timeout=5)
+        return any(m.get("name", "").split(":")[0] == model.split(":")[0] for m in tags.get("models", []))
+    except Exception:
+        return False
+
+
+def whisper_dir(size):
+    return os.path.join(MODELS_DIR, f"whisper-{size}")
+
+
+def whisper_ready(size):
+    return all(os.path.exists(os.path.join(whisper_dir(size), f)) for f in WHISPER_FILES)
+
+
+def voice_path(vid):
+    return os.path.join(VOICES_DIR, vid + ".onnx")
+
+
+def voice_ready(vid):
+    return os.path.exists(voice_path(vid)) and os.path.exists(voice_path(vid) + ".json")
+
+
+def fetch_voice(vid, job=None):
+    if vid not in VOICE_IDS:
+        raise ValueError("Unknown voice")
+    lang, name, quality = vid.split("-", 2)
+    base = f"https://huggingface.co/rhasspy/piper-voices/resolve/main/{lang.split('_')[0]}/{lang}/{name}/{quality}/{vid}"
+    download(base + ".onnx.json", voice_path(vid) + ".json")
+    download(base + ".onnx", voice_path(vid), job, "Voice " + vid)
+
+
+def run_extra(name, opts):
+    try:
+        job_update(name, state="running", step="Installing Python packages (a few minutes)…", detail="", progress=None, error="")
+        module_of = {"pypdf": "pypdf", "numpy": "numpy", "faster-whisper": "faster_whisper", "piper-tts": "piper"}
+        missing = [p for p in EXTRAS[name] if not have(module_of[p.split(">")[0].split("<")[0].split("=")[0]])]
+        if missing:
+            pip_install(missing)
+        if name == "folders":
+            if not ollama_has(EMBED_MODEL):
+                job_update(name, step="Downloading the AI search model (about 275 MB)…", progress=0)
+                ollama_pull(EMBED_MODEL, name)
+            FOLDERS.wake()
+        else:
+            size = opts.get("stt_model") if opts.get("stt_model") in WHISPER_SIZES else load_cfg().get("stt_model", "small")
+            if not whisper_ready(size):
+                job_update(name, step=f"Downloading speech recognition ({WHISPER_SIZES[size]} MB)…", progress=0)
+                for f in WHISPER_FILES:
+                    download(f"https://huggingface.co/Systran/faster-whisper-{size}/resolve/main/{f}",
+                             os.path.join(whisper_dir(size), f), name, f"Whisper {size} · {f}")
+            for vid in opts.get("voices") or [load_cfg().get("tts_voice", "en_GB-alan-medium")]:
+                if not voice_ready(vid):
+                    job_update(name, step=f"Downloading voice {vid} (about 60 MB)…", progress=0)
+                    fetch_voice(vid, name)
+            cfg = load_cfg()
+            cfg["stt_model"] = size
+            save_cfg(cfg)
+        job_update(name, state="done", step="Ready", detail="", progress=1)
+    except Exception as e:  # noqa: BLE001
+        log("extra failed", name, traceback.format_exc())
+        job_update(name, state="error", error=f"{type(e).__name__}: {e}")
+
+
+def start_extra(name, opts=None):
+    with _jobs_lock:
+        if JOBS.get(name, {}).get("state") == "running":
+            return
+        JOBS[name] = {"state": "running", "step": "Starting…"}
+    threading.Thread(target=run_extra, args=(name, opts or {}), daemon=True).start()
+
+
+# ------------------------------------------------------------ offline voice
+class Voice:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.stt = None
+        self.stt_size = None
+        self.voices = {}
+
+    def status(self):
+        cfg = load_cfg()
+        size = cfg.get("stt_model", "small")
+        return {
+            "packages": have("faster_whisper") and have("piper"),
+            "stt_model": size, "stt_ready": whisper_ready(size), "stt_language": cfg.get("stt_language", ""),
+            "tts_voice": cfg.get("tts_voice", "en_GB-alan-medium"),
+            "voices": [{"id": v, "label": label, "installed": voice_ready(v)} for v, label in VOICE_CATALOG],
+            "job": JOBS.get("voice", {"state": "idle"}),
+        }
+
+    def transcribe(self, wav_bytes, language=None, quick=False):
+        import io
+        import wave
+        import numpy as np
+        size = load_cfg().get("stt_model", "small")
+        if not whisper_ready(size):
+            raise RuntimeError("Offline speech recognition is not set up yet.")
+        with wave.open(io.BytesIO(wav_bytes), "rb") as w:
+            if w.getsampwidth() != 2:
+                raise ValueError("Expected 16-bit WAV audio")
+            sr, ch = w.getframerate(), w.getnchannels()
+            pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+        if ch > 1:
+            pcm = pcm.reshape(-1, ch).mean(axis=1)
+        if sr != 16000:
+            pcm = np.interp(np.arange(0, len(pcm), sr / 16000.0), np.arange(len(pcm)), pcm).astype(np.float32)
+        with self.lock:
+            if self.stt is None or self.stt_size != size:
+                from faster_whisper import WhisperModel
+                self.stt = WhisperModel(whisper_dir(size), device="cpu", compute_type="int8",
+                                        cpu_threads=max(1, (os.cpu_count() or 4) - 1))
+                self.stt_size = size
+            t = time.time()
+            segs, info = self.stt.transcribe(pcm, language=language or None, beam_size=1 if quick else 3,
+                                             vad_filter=not quick, condition_on_previous_text=False)
+            text = " ".join(s.text.strip() for s in segs).strip()
+        return {"text": text, "language": info.language, "seconds": round(time.time() - t, 2), "audio_seconds": round(len(pcm) / 16000, 1)}
+
+    def pick_voice(self, text, wanted):
+        # Telugu, Hindi or Malayalam script: use an installed voice for that language when there is one.
+        scripts = [("te_IN", 0x0C00, 0x0C7F), ("hi_IN", 0x0900, 0x097F), ("ml_IN", 0x0D00, 0x0D7F)]
+        for prefix, lo, hi in scripts:
+            n = sum(1 for ch in text if lo <= ord(ch) <= hi)
+            if n > max(3, len(text) * 0.2):
+                for v, _ in VOICE_CATALOG:
+                    if v.startswith(prefix) and voice_ready(v):
+                        return v
+        return wanted
+
+    def speak(self, text, voice=None):
+        import io
+        import wave
+        vid = self.pick_voice(text, voice if voice in VOICE_IDS else load_cfg().get("tts_voice", "en_GB-alan-medium"))
+        if not voice_ready(vid):
+            raise RuntimeError(f"The voice {vid} is not downloaded yet.")
+        with self.lock:
+            v = self.voices.get(vid)
+            if v is None:
+                from piper import PiperVoice
+                v = self.voices[vid] = PiperVoice.load(voice_path(vid))
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as w:
+                if hasattr(v, "synthesize_wav"):
+                    v.synthesize_wav(text, w)
+                else:  # piper-tts < 1.3
+                    v.synthesize(text, w)
+        return buf.getvalue()
+
+
+VOICE = Voice()
+
+
+# ------------------------------------------------------------ folder search
+DOC_EXT = {".pdf", ".docx", ".pptx", ".xlsx", ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".log", ".rtf",
+           ".html", ".htm", ".xml", ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".c", ".cpp", ".h", ".cs", ".go",
+           ".rs", ".php", ".rb", ".kt", ".swift", ".sql", ".sh", ".ps1", ".yaml", ".yml", ".ini", ".tex"}
+SKIP_DIRS = {"node_modules", "__pycache__", ".git", "venv", ".venv", "appdata", "$recycle.bin", "system volume information",
+             "dist", "build", ".cache", "site-packages", "windows", "program files", "program files (x86)"}
+MAX_FILE = 30_000_000
+MAX_FILES = 8000
+
+
+def _xml_text(xml, tag):
+    import re
+    import html
+    return [html.unescape(m) for m in re.findall(rf"<{tag}(?:\s[^>]*)?>([^<]*)</{tag}>", xml)]
+
+
+def extract_text(path):
+    """Return [(label, text)] parts: pages for PDF, slides for PPTX, sheets for XLSX, one part otherwise."""
+    import re
+    import zipfile
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".pdf":
+        if not have("pypdf"):
+            raise RuntimeError("PDF support is not installed")
+        from pypdf import PdfReader
+        r = PdfReader(path)
+        return [(f"page {i + 1}", (p.extract_text() or "")) for i, p in enumerate(r.pages[:400])]
+    if ext == ".docx":
+        with zipfile.ZipFile(path) as z:
+            xml = z.read("word/document.xml").decode("utf-8", "ignore")
+        paras = ["".join(_xml_text(p, "w:t")) for p in re.findall(r"<w:p[ >].*?</w:p>", xml, flags=re.S)]
+        return [("", "\n".join(p for p in paras if p.strip()))]
+    if ext == ".pptx":
+        with zipfile.ZipFile(path) as z:
+            names = sorted((n for n in z.namelist() if re.match(r"ppt/slides/slide\d+\.xml$", n)), key=lambda n: int(re.findall(r"\d+", n)[0]))
+            return [(f"slide {i + 1}", " ".join(_xml_text(z.read(n).decode("utf-8", "ignore"), "a:t"))) for i, n in enumerate(names)]
+    if ext == ".xlsx":
+        with zipfile.ZipFile(path) as z:
+            shared = []
+            if "xl/sharedStrings.xml" in z.namelist():
+                sx = z.read("xl/sharedStrings.xml").decode("utf-8", "ignore")
+                shared = ["".join(_xml_text(si, "t")) for si in re.findall(r"<si>.*?</si>", sx, flags=re.S)]
+            parts = []
+            for n in sorted(n for n in z.namelist() if re.match(r"xl/worksheets/sheet\d+\.xml$", n))[:20]:
+                sx = z.read(n).decode("utf-8", "ignore")
+                rows = []
+                for row in re.findall(r"<row[ >].*?</row>", sx, flags=re.S)[:3000]:
+                    cells = []
+                    for attrs, val in re.findall(r"<c([^>]*)>(?:.*?<v>([^<]*)</v>)?.*?</c>", row, flags=re.S):
+                        if 't="s"' in attrs and val.isdigit() and int(val) < len(shared):
+                            cells.append(shared[int(val)])
+                        else:
+                            cells.append(val)
+                    rows.append(" | ".join(c for c in cells if c))
+                parts.append((os.path.basename(n).replace(".xml", ""), "\n".join(r for r in rows if r)))
+            return parts
+    with open(path, "rb") as f:
+        raw = f.read(3_000_000)
+    text = raw.decode("utf-8", "ignore")
+    if ext in (".html", ".htm", ".xml", ".rtf"):
+        text = strip_tags(text)
+    return [("", text)]
+
+
+def chunk_parts(parts, size=1100, overlap=180):
+    out = []
+    for label, text in parts:
+        text = " ".join((text or "").split())
+        if not text:
+            continue
+        i = 0
+        while i < len(text):
+            piece = text[i:i + size]
+            if i + size < len(text):  # end on a sentence or word boundary
+                cut = max(piece.rfind(". "), piece.rfind("? "), piece.rfind("! "))
+                if cut < size * 0.5:
+                    cut = piece.rfind(" ")
+                if cut > size * 0.3:
+                    piece = piece[:cut + 1]
+            out.append((label, piece.strip()))
+            if i + len(piece) >= len(text):
+                break
+            i += max(1, len(piece) - overlap)
+    return out
+
+
+def embed(texts, query=False):
+    cfg = load_cfg()
+    prefix = "search_query: " if query else "search_document: "
+    j = http_json(cfg["ollama_url"].rstrip("/") + "/api/embed",
+                  body={"model": EMBED_MODEL, "input": [prefix + t for t in texts], "truncate": True}, timeout=300)
+    if j.get("error"):
+        raise RuntimeError(j["error"])
+    vecs = []
+    for v in j.get("embeddings") or []:
+        n = sum(x * x for x in v) ** 0.5 or 1.0
+        vecs.append([x / n for x in v])
+    return vecs
+
+
+def pack(vec):
+    from array import array
+    return array("f", vec).tobytes()
+
+
+def unpack(blob):
+    from array import array
+    a = array("f")
+    a.frombytes(blob)
+    return a
+
+
+def default_folders():
+    home = os.path.expanduser("~")
+    out = []
+    for name in ("Documents", "Downloads", "Desktop", "OneDrive\\Documents" if IS_WIN else "Notes"):
+        p = os.path.join(home, name)
+        if os.path.isdir(p):
+            out.append(p)
+    return out
+
+
+def folder_allowed(path):
+    p = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isdir(p):
+        return None, "That folder does not exist on this PC."
+    drive, rest = os.path.splitdrive(p)
+    if rest.strip("\\/") == "":
+        return None, "Pick a folder (like Documents), not a whole drive."
+    if IS_WIN:
+        sysroots = [os.environ.get(k, "") for k in ("SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData", "APPDATA", "LOCALAPPDATA")]
+    else:
+        sysroots = ["/usr", "/etc", "/bin", "/sbin", "/lib", "/proc", "/sys", "/dev", "/var", "/boot", "/System", "/Library", "/Applications"]
+    norm = os.path.normcase(p)
+    for root in sysroots:
+        r = os.path.normcase(os.path.abspath(root)) if root else ""
+        if r and (norm == r or norm.startswith(r.rstrip("\\/") + os.sep)):
+            return None, "System folders can't be indexed. Pick a folder with your own files."
+    return p, ""
+
+
+class Folders:
+    """Indexes the user's chosen folders into SQLite with embeddings from Ollama."""
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.status = {"state": "idle", "folder": "", "file": "", "done": 0, "total": 0, "last_run": None, "error": ""}
+        self.cache = None
+        self.lock = threading.Lock()
+
+    def wake(self):
+        self.event.set()
+
+    def folders(self):
+        return [f for f in load_cfg().get("folders") or [] if isinstance(f, str)]
+
+    def ready(self):
+        return {"pypdf": have("pypdf"), "numpy": have("numpy"), "embed_model": ollama_has(EMBED_MODEL)}
+
+    def stats(self):
+        with db() as con:
+            rows = {r["folder"]: dict(r) for r in con.execute(
+                "SELECT folder, COUNT(*) AS docs, SUM(chunks) AS chunks, SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS errors FROM docs GROUP BY folder")}
+        return [{"path": f, "docs": rows.get(f, {}).get("docs", 0), "chunks": rows.get(f, {}).get("chunks") or 0,
+                 "errors": rows.get(f, {}).get("errors", 0)} for f in self.folders()]
+
+    def loop(self):
+        while True:
+            self.event.wait(timeout=1800)  # re-check every 30 minutes, or when woken
+            self.event.clear()
+            try:
+                if self.folders() and ollama_has(EMBED_MODEL):
+                    self.index_all()
+            except Exception as e:  # noqa: BLE001
+                log("index error", traceback.format_exc())
+                self.status.update(state="error", error=str(e))
+
+    def index_all(self):
+        folders = self.folders()
+        with db() as con:  # forget folders the user removed
+            gone = [r["folder"] for r in con.execute("SELECT DISTINCT folder FROM docs") if r["folder"] not in folders]
+            for g in gone:
+                con.execute("DELETE FROM chunks WHERE doc_id IN (SELECT id FROM docs WHERE folder=?)", (g,))
+                con.execute("DELETE FROM docs WHERE folder=?", (g,))
+        for folder in folders:
+            files = []
+            for root, dirs, names in os.walk(folder):
+                dirs[:] = [d for d in dirs if not d.startswith(".") and d.lower() not in SKIP_DIRS]
+                for n in names:
+                    if os.path.splitext(n)[1].lower() in DOC_EXT and not n.startswith("~$"):
+                        p = os.path.join(root, n)
+                        try:
+                            st = os.stat(p)
+                        except OSError:
+                            continue
+                        if st.st_size <= MAX_FILE:
+                            files.append((p, st.st_mtime, st.st_size))
+                if len(files) >= MAX_FILES:
+                    break
+            self.status.update(state="indexing", folder=folder, done=0, total=len(files), error="")
+            seen = set()
+            for i, (p, mtime, size) in enumerate(files):
+                seen.add(p)
+                self.status.update(file=os.path.basename(p), done=i)
+                with db() as con:
+                    row = con.execute("SELECT id, mtime, size, status FROM docs WHERE path=?", (p,)).fetchone()
+                if row and row["mtime"] == mtime and row["size"] == size and row["status"] in ("ok", "empty"):
+                    continue
+                self.index_file(folder, p, mtime, size, row["id"] if row else None)
+            with db() as con:  # files deleted from disk
+                for r in con.execute("SELECT id, path FROM docs WHERE folder=?", (folder,)).fetchall():
+                    if r["path"] not in seen:
+                        con.execute("DELETE FROM chunks WHERE doc_id=?", (r["id"],))
+                        con.execute("DELETE FROM docs WHERE id=?", (r["id"],))
+        self.cache = None
+        self.status.update(state="idle", folder="", file="", done=self.status.get("total", 0), last_run=time.time())
+
+    def index_file(self, folder, path, mtime, size, doc_id):
+        status, err, pieces = "ok", "", []
+        try:
+            pieces = chunk_parts(extract_text(path))
+        except Exception as e:  # noqa: BLE001
+            status, err = "error", f"{type(e).__name__}: {e}"[:300]
+        vecs = []
+        try:
+            for b in range(0, len(pieces), 16):
+                vecs += embed([f"{os.path.basename(path)} {label}: {t}" for label, t in pieces[b:b + 16]])
+        except Exception as e:  # noqa: BLE001
+            status, err, pieces, vecs = "error", f"Embedding failed: {e}"[:300], [], []
+        if status == "ok" and not pieces:
+            status = "empty"
+        with db() as con:
+            if doc_id:
+                con.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
+                con.execute("UPDATE docs SET mtime=?, size=?, chunks=?, status=?, error=? WHERE id=?", (mtime, size, len(pieces), status, err, doc_id))
+            else:
+                doc_id = con.execute("INSERT INTO docs(folder, path, mtime, size, chunks, status, error) VALUES(?,?,?,?,?,?,?)",
+                                     (folder, path, mtime, size, len(pieces), status, err)).lastrowid
+            con.executemany("INSERT INTO chunks(doc_id, idx, label, text, vec) VALUES(?,?,?,?,?)",
+                            [(doc_id, i, label, t, pack(v)) for i, ((label, t), v) in enumerate(zip(pieces, vecs))])
+        self.cache = None
+
+    def _matrix(self):
+        with self.lock:
+            if self.cache is None:
+                with db() as con:
+                    rows = con.execute("SELECT c.id, c.vec FROM chunks c JOIN docs d ON d.id=c.doc_id WHERE d.status='ok'").fetchall()
+                ids = [r["id"] for r in rows]
+                if have("numpy"):
+                    import numpy as np
+                    mat = np.frombuffer(b"".join(r["vec"] for r in rows), dtype=np.float32).reshape(len(rows), -1) if rows else None
+                else:
+                    mat = [unpack(r["vec"]) for r in rows]
+                self.cache = (ids, mat)
+            return self.cache
+
+    def search(self, query, k=6):
+        ids, mat = self._matrix()
+        if not ids:
+            return []
+        q = embed([query], query=True)[0]
+        if have("numpy"):
+            import numpy as np
+            scores = mat @ np.asarray(q, dtype=np.float32)
+            order = np.argsort(-scores)[: k * 3]
+            ranked = [(ids[i], float(scores[i])) for i in order]
+        else:
+            scored = [(ids[i], sum(a * b for a, b in zip(v, q))) for i, v in enumerate(mat)]
+            ranked = sorted(scored, key=lambda x: -x[1])[: k * 3]
+        words = {w for w in query.lower().split() if len(w) > 3}
+        out = []
+        with db() as con:
+            for cid, score in ranked:
+                r = con.execute("SELECT c.text, c.label, d.path, d.folder FROM chunks c JOIN docs d ON d.id=c.doc_id WHERE c.id=?", (cid,)).fetchone()
+                if not r:
+                    continue
+                name = os.path.basename(r["path"])
+                bonus = 0.05 * sum(1 for w in words if w in name.lower())  # "the physics pdf" -> files named physics
+                out.append({"path": r["path"], "name": name, "label": r["label"], "text": r["text"], "score": round(score + bonus, 3),
+                            "folder": r["folder"]})
+        out.sort(key=lambda x: -x["score"])
+        return out[:k]
+
+
+FOLDERS = Folders()
+
+
+def inside_folders(path):
+    p = os.path.normcase(os.path.abspath(path))
+    for f in FOLDERS.folders():
+        base = os.path.normcase(os.path.abspath(f))
+        try:
+            if os.path.commonpath([p, base]) == base:
+                return True
+        except ValueError:  # different drives on Windows
+            continue
+    return False
+
+
+def open_path(p):
+    if IS_WIN:
+        os.startfile(p)  # noqa: S606 - opens with the user's default app
+    elif IS_MAC:
+        subprocess.Popen(["open", p])
+    else:
+        subprocess.Popen(["xdg-open", p], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ---------------------------------------------------------------- PC actions
+# A fixed list of safe actions. Nothing here runs a command the user (or a web page) typed.
+APPS_WIN = {
+    "notepad": ["notepad.exe"], "calculator": "calculator:", "paint": ["mspaint.exe"], "file explorer": ["explorer.exe"],
+    "settings": "ms-settings:", "task manager": ["taskmgr.exe"], "camera": "microsoft.windows.camera:", "photos": "ms-photos:",
+    "clock": "ms-clock:", "snipping tool": "ms-screenclip:", "microsoft store": "ms-windows-store:", "spotify": "spotify:",
+    "whatsapp": "whatsapp:", "edge": "microsoft-edge:", "chrome": "chrome.exe", "word": "winword.exe", "excel": "excel.exe",
+    "powerpoint": "powerpnt.exe", "outlook": "outlook.exe", "vs code": "__vscode__", "terminal": "__terminal__",
+    "command prompt": ["cmd.exe"], "powershell": ["powershell.exe"], "control panel": ["control.exe"], "teams": "msteams:",
+}
+FOLDER_NAMES = {"documents": "Documents", "downloads": "Downloads", "desktop": "Desktop", "pictures": "Pictures",
+                "music": "Music", "videos": "Videos", "home": ""}
+MEDIA_KEYS = {"play_pause": 0xB3, "next": 0xB0, "previous": 0xB1, "mute": 0xAD, "volume_down": 0xAE, "volume_up": 0xAF}
+
+
+def _launch_win(target):
+    if target == "__vscode__":
+        for exe in (os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Microsoft VS Code", "Code.exe"),
+                    os.path.join(os.environ.get("ProgramFiles", ""), "Microsoft VS Code", "Code.exe")):
+            if os.path.exists(exe):
+                subprocess.Popen([exe])
+                return
+        if shutil.which("code"):  # code.cmd on PATH
+            subprocess.Popen(["cmd", "/c", "code"], creationflags=NO_WINDOW)
+            return
+        raise RuntimeError("VS Code doesn't seem to be installed.")
+    if target == "__terminal__":
+        target = "wt.exe" if shutil.which("wt") else ["powershell.exe"]
+    if isinstance(target, list):
+        subprocess.Popen(target, creationflags=subprocess.CREATE_NEW_CONSOLE if target[0] in ("cmd.exe", "powershell.exe") else 0)
+    else:
+        os.startfile(target)  # noqa: S606 - URI schemes and App Paths (winword.exe, chrome.exe…)
+
+
+def disk_report():
+    drives = []
+    if IS_WIN:
+        for letter in "CDEFGHIJ":
+            root = f"{letter}:\\"
+            if os.path.exists(root):
+                try:
+                    u = shutil.disk_usage(root)
+                    drives.append({"drive": root, "total": u.total, "free": u.free})
+                except OSError:
+                    pass
+    else:
+        u = shutil.disk_usage("/")
+        drives.append({"drive": "/", "total": u.total, "free": u.free})
+    home = os.path.expanduser("~")
+    deadline = time.time() + 12
+
+    def size_of(path):
+        total = 0
+        stack = [path]
+        while stack and time.time() < deadline:
+            try:
+                with os.scandir(stack.pop()) as it:
+                    for e in it:
+                        try:
+                            if e.is_symlink():
+                                continue
+                            if e.is_dir():
+                                stack.append(e.path)
+                            else:
+                                total += e.stat().st_size
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+        return total
+
+    folders = []
+    for name in ("Downloads", "Documents", "Desktop", "Pictures", "Videos", "Music", "OneDrive", os.path.join("AppData", "Local", "Temp")):
+        p = os.path.join(home, name)
+        if os.path.isdir(p):
+            folders.append({"name": name, "path": p, "size": size_of(p)})
+    big = []
+    for name in ("Downloads", "Desktop", "Videos", "Documents"):
+        p = os.path.join(home, name)
+        for root, dirs, files in os.walk(p):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for f in files:
+                try:
+                    big.append({"path": os.path.join(root, f), "size": os.path.getsize(os.path.join(root, f))})
+                except OSError:
+                    pass
+            if time.time() > deadline + 6:
+                break
+    big.sort(key=lambda x: -x["size"])
+    folders.sort(key=lambda x: -x["size"])
+    return {"drives": drives, "folders": folders, "largest": big[:10], "partial": time.time() > deadline}
+
+
+def run_action(action, args):
+    args = args or {}
+    if action == "open_url":
+        url = str(args.get("url") or "")
+        if not url.startswith(("https://", "http://")):
+            raise ValueError("Only web addresses can be opened.")
+        import webbrowser
+        webbrowser.open(url)
+        return {"message": f"Opened {urllib.parse.urlparse(url).netloc}"}
+    if action == "open_app":
+        app = str(args.get("app") or "").lower()
+        if IS_WIN:
+            if app not in APPS_WIN:
+                raise ValueError(f"I can't open “{app}” yet.")
+            _launch_win(APPS_WIN[app])
+        elif IS_MAC:
+            mac = {"vs code": "Visual Studio Code", "chrome": "Google Chrome", "calculator": "Calculator", "notepad": "TextEdit",
+                   "terminal": "Terminal", "settings": "System Settings", "spotify": "Spotify", "word": "Microsoft Word",
+                   "excel": "Microsoft Excel", "powerpoint": "Microsoft PowerPoint", "file explorer": "Finder"}
+            if app not in mac:
+                raise ValueError(f"I can't open “{app}” on this Mac yet.")
+            subprocess.Popen(["open", "-a", mac[app]])
+        else:
+            lin = {"vs code": "code", "chrome": "google-chrome", "calculator": "gnome-calculator", "terminal": "x-terminal-emulator",
+                   "file explorer": "xdg-open", "notepad": "gedit"}
+            exe = lin.get(app)
+            if not exe or not shutil.which(exe):
+                raise ValueError(f"I can't open “{app}” here.")
+            subprocess.Popen([exe] + ([os.path.expanduser("~")] if exe == "xdg-open" else []))
+        return {"message": f"Opened {app}"}
+    if action == "open_folder":
+        name = str(args.get("name") or "").lower()
+        if name not in FOLDER_NAMES:
+            raise ValueError("Unknown folder")
+        p = os.path.join(os.path.expanduser("~"), FOLDER_NAMES[name])
+        open_path(p)
+        return {"message": f"Opened {name}"}
+    if action == "open_file":
+        p = str(args.get("path") or "")
+        if not (os.path.isfile(p) and inside_folders(p)):
+            raise ValueError("I can only open files inside the folders you added to Jarvis.")
+        open_path(p)
+        return {"message": f"Opened {os.path.basename(p)}"}
+    if action == "media":
+        key = str(args.get("key") or "")
+        if key not in MEDIA_KEYS or not IS_WIN:
+            raise ValueError("Media keys work on Windows only." if key in MEDIA_KEYS else "Unknown media key")
+        import ctypes
+        for _ in range(max(1, min(int(args.get("times") or 1), 10))):
+            ctypes.windll.user32.keybd_event(MEDIA_KEYS[key], 0, 0, 0)
+            ctypes.windll.user32.keybd_event(MEDIA_KEYS[key], 0, 2, 0)
+        return {"message": key.replace("_", " ")}
+    if action == "lock":
+        if not IS_WIN:
+            raise ValueError("Locking works on Windows only.")
+        import ctypes
+        ctypes.windll.user32.LockWorkStation()
+        return {"message": "Locked"}
+    if action == "remind":
+        at = float(args.get("at") or 0)
+        text = str(args.get("text") or "Reminder")[:300]
+        if at < time.time() - 60 or at > time.time() + 366 * 86400:
+            raise ValueError("That reminder time is not valid.")
+        rid = uuid.uuid4().hex[:10]
+        with db() as con:
+            con.execute("INSERT INTO reminders(id, at, text, done, created) VALUES(?,?,?,0,?)", (rid, at, text, time.time()))
+        return {"message": "Reminder set", "id": rid, "at": at}
+    if action == "disk":
+        return {"message": "Disk report", "data": disk_report()}
+    raise ValueError("Unknown action")
+
+
+def due_reminders():
+    now = time.time()
+    with db() as con:
+        rows = con.execute("SELECT * FROM reminders WHERE done=0 AND at<=?", (now,)).fetchall()
+        for r in rows:
+            con.execute("UPDATE reminders SET done=1 WHERE id=?", (r["id"],))
+            rid = uuid.uuid4().hex[:12]
+            con.execute("INSERT INTO runs(id,task_id,task_name,started,finished,status,output,sources,read) VALUES(?,?,?,?,?,?,?,?,0)",
+                        (rid, "reminder", "⏰ Reminder", now, now, "done", r["text"], "[]"))
+            site = (load_cfg().get("site_url") or DEFAULT_CFG["site_url"]).rstrip("/")
+            notify("⏰ Reminder", r["text"], f"{site}/?run={rid}")
 
 # --------------------------------------------------------------------- http
 class Handler(BaseHTTPRequestHandler):
@@ -591,6 +1355,20 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _raw(self, limit=8_000_000):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > limit:
+            raise ValueError("Request too large")
+        return self.rfile.read(n) if n else b""
+
+    def _send_bytes(self, code, data, ctype):
+        self.send_response(code)
+        self._cors()
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -631,6 +1409,17 @@ class Handler(BaseHTTPRequestHandler):
                 })
             if path == "/system":
                 return self._send(200, VITALS.snapshot())
+            if path == "/jobs":
+                return self._send(200, {"jobs": JOBS})
+            if path == "/voice":
+                return self._send(200, VOICE.status())
+            if path == "/folders":
+                return self._send(200, {"folders": FOLDERS.stats(), "index": FOLDERS.status, "ready": FOLDERS.ready(),
+                                        "suggestions": default_folders(), "job": JOBS.get("folders", {"state": "idle"})})
+            if path == "/reminders":
+                with db() as con:
+                    rows = [dict(r) for r in con.execute("SELECT * FROM reminders WHERE done=0 ORDER BY at")]
+                return self._send(200, {"reminders": rows})
             if path == "/tasks":
                 with db() as con:
                     rows = [row_task(r) for r in con.execute("SELECT * FROM tasks ORDER BY created")]
@@ -659,7 +1448,63 @@ class Handler(BaseHTTPRequestHandler):
         if not self._guard(path):
             return
         try:
+            if path == "/stt":
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                return self._send(200, VOICE.transcribe(self._raw(), language=(q.get("lang") or [""])[0] or load_cfg().get("stt_language") or None,
+                                                         quick=(q.get("quick") or ["0"])[0] == "1"))
             body = self._body()
+            if path == "/tts":
+                text = str(body.get("text") or "").strip()[:2500]
+                if not text:
+                    return self._send(400, {"error": "Nothing to say"})
+                return self._send_bytes(200, VOICE.speak(text, body.get("voice")), "audio/wav")
+            if path == "/extras/install":
+                name = body.get("name")
+                if name not in EXTRAS:
+                    return self._send(400, {"error": "Unknown add-on"})
+                opts = {"stt_model": body.get("stt_model")}
+                if isinstance(body.get("voices"), list):
+                    opts["voices"] = [v for v in body["voices"] if v in VOICE_IDS][:4]
+                start_extra(name, opts)
+                return self._send(200, {"ok": True})
+            if path == "/voice/config":
+                cfg = load_cfg()
+                if body.get("tts_voice") in VOICE_IDS:
+                    cfg["tts_voice"] = body["tts_voice"]
+                if body.get("stt_model") in WHISPER_SIZES:
+                    cfg["stt_model"] = body["stt_model"]
+                if "stt_language" in body:
+                    cfg["stt_language"] = str(body.get("stt_language") or "")[:5]
+                save_cfg(cfg)
+                return self._send(200, VOICE.status())
+            if path == "/folders":
+                p, why = folder_allowed(str(body.get("path") or ""))
+                if not p:
+                    return self._send(400, {"error": why})
+                cfg = load_cfg()
+                if p not in cfg["folders"]:
+                    cfg["folders"] = (cfg.get("folders") or []) + [p]
+                    save_cfg(cfg)
+                FOLDERS.wake()
+                return self._send(200, {"ok": True, "path": p})
+            if path == "/folders/remove":
+                cfg = load_cfg()
+                cfg["folders"] = [f for f in cfg.get("folders") or [] if f != body.get("path")]
+                save_cfg(cfg)
+                FOLDERS.wake()
+                return self._send(200, {"ok": True})
+            if path == "/folders/reindex":
+                FOLDERS.wake()
+                return self._send(200, {"ok": True})
+            if path == "/folders/search":
+                q = str(body.get("query") or "").strip()
+                if not q:
+                    return self._send(400, {"error": "Empty query"})
+                if not ollama_has(EMBED_MODEL):
+                    return self._send(400, {"error": "Folder search is not set up yet. Open WORKSPACE → MY FOLDERS and press SET UP."})
+                return self._send(200, {"results": FOLDERS.search(q, int(body.get("k") or 6))})
+            if path == "/actions/run":
+                return self._send(200, {"ok": True, **run_action(str(body.get("action") or ""), body.get("args"))})
             if path == "/config":
                 cfg = load_cfg()
                 if "searchKey" in body:
@@ -719,6 +1564,9 @@ class Handler(BaseHTTPRequestHandler):
                     con.execute("UPDATE runs SET read=1 WHERE id=?", (parts[1],))
                 return self._send(200, {"ok": True})
             self._send(404, {"error": "Not found"})
+        except (ValueError, RuntimeError) as e:  # a clear message for the HUD
+            log("POST refused", path, str(e))
+            self._send(400, {"error": str(e)})
         except Exception as e:  # noqa: BLE001
             log("POST error", path, traceback.format_exc())
             self._send(500, {"error": str(e)})
@@ -732,6 +1580,10 @@ class Handler(BaseHTTPRequestHandler):
             with db() as con:
                 con.execute("DELETE FROM tasks WHERE id=?", (parts[1],))
             return self._send(200, {"ok": True})
+        if len(parts) == 2 and parts[0] == "reminders":
+            with db() as con:
+                con.execute("DELETE FROM reminders WHERE id=?", (parts[1],))
+            return self._send(200, {"ok": True})
         self._send(404, {"error": "Not found"})
 
 
@@ -743,6 +1595,8 @@ def main():
         log("port in use; another Companion is probably running")
         sys.exit(0)
     threading.Thread(target=scheduler_loop, daemon=True).start()
+    threading.Thread(target=FOLDERS.loop, daemon=True).start()
+    FOLDERS.wake()
     log(f"Jarvis Companion {VERSION} listening on http://{HOST}:{PORT} (data: {HOME})")
     print(f"Jarvis Companion {VERSION} running on http://{HOST}:{PORT}")
     server.serve_forever()

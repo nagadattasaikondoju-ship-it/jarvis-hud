@@ -88,6 +88,9 @@ Most AI assistants send everything you type to a company's servers. This one doe
 | 🧩 | **Reasoning trace** | When a model emits `<think>` reasoning, it's tucked into an expandable "Reasoning trace" instead of cluttering the answer |
 | 📡 | **Link telemetry** | Live connection latency with a sparkline, time to first token and tokens per second |
 | 💰 | **Efficiency panel** | In OpenJarvis mode: dollars saved compared with cloud models, tokens processed on-device and cloud energy avoided |
+| 📁 | **Chat with your folders** | Add folders such as Documents under **WORKSPACE → MY FOLDERS**. Jarvis indexes PDF, Word, PowerPoint, Excel, text and code files **on your PC** with a small embedding model (`nomic-embed-text`, ~275 MB) and answers questions like *"what did my physics notes say about the exam?"* with citations and an **OPEN** button for each file |
+| 🖱️ | **PC actions** | *"Open YouTube"*, *"open VS Code"*, *"play lofi on YouTube"*, *"volume up"*, *"pause"*, *"lock my PC"*, *"remind me at 6 pm to call mom"*, *"what's taking up my disk?"*. Only a fixed list of safe actions exists; nothing deletes files or runs typed commands |
+| 🔇 | **Fully offline voice** | Optional: **Whisper** (speech to text) and **Piper** (natural voices, including Telugu, Hindi and Malayalam) run on your PC through the Companion, for the mic, conversation mode and the wake word. Set up in **CONFIG → VOICE** (~1 GB download) |
 | 🪄 | **AUTO mode** | No need to pick a mode: Jarvis reads your message and chooses CREATE FILE (and the format), TRANSLATE (and the language), WRITE (type and tone), DASHBOARD, ARTIFACT, RESEARCH or CHAT, instantly. Click a mode button to force it for one message |
 | ⚡ | **Protocols** | One-click commands: Status Report, Brief Me, Plan My Day, Explain Simply, Run Diagnostics |
 | 🎭 | **Persona editor** | Change Jarvis's personality with your own system prompt |
@@ -268,8 +271,15 @@ The key is stored only in `%LOCALAPPDATA%\JarvisCompanion\config.json` on your P
 | `GET /runs`, `GET /runs/{id}`, `POST /runs/{id}/read` | Results inbox |
 | `GET /system` | Live vitals: CPU %, RAM, battery, CPU temperature (Linux), NVIDIA GPU load, memory, temperature and power (via `nvidia-smi`) — v1.1 |
 | `POST /notify/test` | Show a test desktop notification — v1.1 |
+| `GET /jobs`, `POST /extras/install` | Install an optional add-on (`folders` or `voice`) with progress: pip packages from a fixed list, then models — v1.2 |
+| `GET/POST /folders`, `POST /folders/remove`, `POST /folders/reindex`, `POST /folders/search` | Folders to index, index status, semantic search over your files — v1.2 |
+| `POST /actions/run` | One action from a fixed list: `open_url` (http/https only), `open_app` (known apps), `open_folder`, `open_file` (only inside your added folders), `media`, `lock`, `remind`, `disk` — v1.2 |
+| `GET /reminders`, `DELETE /reminders/{id}` | Pending reminders (they fire as a notification and land in the inbox) — v1.2 |
+| `GET /voice`, `POST /voice/config`, `POST /stt`, `POST /tts` | Offline voice status and settings, speech to text (16 kHz WAV in), text to speech (WAV out) — v1.2 |
 
 Scheduled tasks call your local Ollama model, optionally after a web search. Results are stored in a local SQLite database, `jarvis.db`. If the PC was off at the scheduled time, the task runs once when the Companion next starts. When a task finishes, the Companion shows a desktop notification (Windows toast, macOS Notification Center, or `notify-send` on Linux); clicking it opens the result in the HUD. Turn this off in **SETUP → COMPANION**.
+
+**Add-ons (v1.2):** *Folder search* installs `pypdf` and `numpy` and pulls `nomic-embed-text` into Ollama (~300 MB). *Offline voice* installs `faster-whisper` and `piper-tts`, downloads the Whisper model (`small`, 480 MB, or `base`, 145 MB) to `%LOCALAPPDATA%\JarvisCompanion\models` and Piper voices (~60 MB each) to `...\voices`. Both are started from buttons in the HUD; nothing is installed until you click.
 
 **Updating:** run the same install command again. It replaces the program, restarts it and keeps your key, tasks and results. The HUD shows an *Update available* notice when a newer Companion exists.
 
@@ -393,6 +403,9 @@ Click the **paperclip**, drag files onto the conversation, or paste an image. Su
 | `jarvis is not recognized` | PATH not refreshed | Close PowerShell and open a new one |
 | Mic says "not supported" | The browser lacks the Web Speech API | Use Chrome or Edge |
 | Wake word doesn't react | Tab closed or mic blocked, or Jarvis is busy | Keep the tab or installed app open; allow the microphone; the **WAKE** pill must be green. Say "Jarvis" clearly, then pause |
+| MY FOLDERS stays on "Reading…" | Large folders take a while the first time (embedding runs through Ollama) | Leave it running; it continues in the background and re-checks every 30 minutes |
+| "PC actions need Jarvis Companion 1.2" | Older Companion | Re-run the Companion install command |
+| Offline voice setup fails at "Installing Python packages" | pip couldn't download or build a package | Check internet access, then see `%LOCALAPPDATA%\JarvisCompanion\companion.log`; run `py -m pip install --user faster-whisper piper-tts` to see the full error |
 | VITALS shows no CPU / GPU | Companion missing or older than 1.1 | Re-run the Companion install command |
 | VITALS says **100% CPU** | The model doesn't fit on the graphics card, or there's no NVIDIA GPU | Use a smaller model or lower **Max context**; update your NVIDIA driver |
 | No desktop notification | Windows notifications or Focus is off | **Settings → System → Notifications**: turn on notifications (and for Windows PowerShell); use **SEND TEST NOTIFICATION** |
@@ -421,6 +434,9 @@ ollama ps                                        # loaded models, and CPU vs GPU
 - **Voice input:** Chrome and Edge send microphone audio to their speech service (Google or Microsoft) for transcription. Typed messages stay local. Where the browser offers **on-device speech recognition**, the HUD uses it (VOICE shows **Speech: ON THIS PC**), and **CONFIG → VOICE** can download it.
 - **Wake word:** while it's on, the microphone stays open and, unless on-device speech is available, its audio goes to the browser's speech service to find the word "Jarvis". It's off by default; turn it off whenever you want full privacy.
 - **Vitals** are read locally by the Companion and sent only to your browser.
+- **Folder search** reads only the folders you add (system folders and whole drives are refused). The index (text snippets and embeddings) is stored in the Companion's `jarvis.db` on your PC; remove a folder to delete its index.
+- **PC actions** are a fixed list in the Companion. Websites open only for `http`/`https` addresses, files only inside your added folders, and there is no "run command", delete or shutdown action.
+- **Offline voice:** with *Use offline speech recognition* on, microphone audio is recorded in the browser and sent only to the Companion on `127.0.0.1`; nothing goes to Google or Microsoft.
 - **Spoken replies** use voices installed on your device.
 - **Web search (OpenJarvis mode):** when the agent searches, the search query goes to a web search provider. The AI model itself stays local.
 - **Chats, projects, attached files and memory** are stored in your browser's IndexedDB on this computer.
@@ -505,7 +521,8 @@ jarvis-hud/
     ├── exporters.js       # Builds .docx / .pptx / .xlsx / .pdf in the browser
     ├── companion.js       # Client for Jarvis Companion (search, tasks, inbox, vitals, notifications)
     ├── wake.js            # "Jarvis" wake word on top of the Web Speech API
-    ├── intent.js          # Spots chat messages that need a web search
+    ├── intent.js          # AUTO mode: picks the tool, PC actions, web and file questions
+    ├── localvoice.js      # Offline voice: mic recording + VAD → WAV, Piper playback, offline wake word
     ├── pwa.js             # Service worker registration, install prompt, app badge
     └── components/
         ├── Workspace.jsx      # Projects, chats, memory
@@ -516,6 +533,8 @@ jarvis-hud/
         ├── Boot.jsx           # Start-up sequence
         ├── Message.jsx        # Chat message: Markdown, steps, reasoning trace
         ├── Vitals.jsx         # Ring gauges + VITALS panel (CPU, RAM, GPU, VRAM, model placement)
+        ├── Folders.jsx        # WORKSPACE → MY FOLDERS: add folders, set up and watch indexing
+        ├── VoiceSetup.jsx     # CONFIG → VOICE: offline Whisper + Piper setup
         └── Settings.jsx       # SETUP / COMPANION / LINK / PERSONA / VOICE modal
 ```
 
@@ -596,7 +615,8 @@ vercel --prod
 - [ ] User accounts and chat history synced across devices
 - [x] Wake word ("Jarvis"), live vitals, FAST / SMART / AUTO model switch
 - [x] Installable app with offline shell and desktop notifications
-- [ ] Fully offline speech recognition (Whisper in the browser)
+- [x] Chat with your own folders, PC actions and reminders
+- [x] Fully offline speech recognition and voices (Whisper + Piper through the Companion)
 - [ ] One-click desktop app bundling Ollama + HUD
 - [ ] Own brand name and custom domain
 - [ ] Themes (classic cyan, amber, crimson)

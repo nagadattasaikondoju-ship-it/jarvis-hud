@@ -3,7 +3,7 @@
 // scheduled tasks in the background, even when the browser is closed.
 // Version 1.1+ also reports live system vitals and shows desktop notifications.
 
-export const COMPANION_LATEST = '1.1.0';
+export const COMPANION_LATEST = '1.2.0';
 export const companionHas = (comp, feature) => !!comp?.ok && Array.isArray(comp.features) && comp.features.includes(feature);
 
 const H = { 'Content-Type': 'application/json', 'X-Jarvis': '1' };
@@ -40,6 +40,34 @@ export const companion = {
   run: (cfg, id) => call(cfg, `/runs/${encodeURIComponent(id)}`),
   system: (cfg) => call(cfg, '/system', {}, 6000),
   testNotify: (cfg) => call(cfg, '/notify/test', { method: 'POST', body: '{}' }, 25000),
+  jobs: (cfg) => call(cfg, '/jobs'),
+  installExtra: (cfg, name, opts = {}) => call(cfg, '/extras/install', { method: 'POST', body: JSON.stringify({ name, ...opts }) }),
+  folders: (cfg) => call(cfg, '/folders', {}, 8000),
+  addFolder: (cfg, path) => call(cfg, '/folders', { method: 'POST', body: JSON.stringify({ path }) }),
+  removeFolder: (cfg, path) => call(cfg, '/folders/remove', { method: 'POST', body: JSON.stringify({ path }) }),
+  reindex: (cfg) => call(cfg, '/folders/reindex', { method: 'POST', body: '{}' }),
+  folderSearch: (cfg, query, k = 6) => call(cfg, '/folders/search', { method: 'POST', body: JSON.stringify({ query, k }) }, 60000),
+  action: (cfg, action, args) => call(cfg, '/actions/run', { method: 'POST', body: JSON.stringify({ action, args }) }, 30000),
+  voice: (cfg) => call(cfg, '/voice', {}, 5000),
+  voiceConfig: (cfg, body) => call(cfg, '/voice/config', { method: 'POST', body: JSON.stringify(body) }),
+  /** Speech to text on the user's PC. `wav` is a 16 kHz mono WAV Blob. */
+  async stt(cfg, wav, { quick = false, lang = '' } = {}) {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 90000);
+    try {
+      const q = new URLSearchParams({ ...(quick ? { quick: '1' } : {}), ...(lang ? { lang } : {}) });
+      const r = await fetch(`${base(cfg)}/stt?${q}`, { method: 'POST', headers: { 'Content-Type': 'audio/wav', 'X-Jarvis': '1' }, body: wav, signal: ctl.signal });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || `Speech recognition failed (HTTP ${r.status})`);
+      return j;
+    } finally { clearTimeout(t); }
+  },
+  /** Text to speech on the user's PC; resolves with a WAV Blob. */
+  async tts(cfg, text, voice) {
+    const r = await fetch(`${base(cfg)}/tts`, { method: 'POST', headers: H, body: JSON.stringify({ text, ...(voice ? { voice } : {}) }) });
+    if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || `Voice failed (HTTP ${r.status})`); }
+    return r.blob();
+  },
   markRead: (cfg, id) => call(cfg, `/runs/${encodeURIComponent(id)}/read`, { method: 'POST', body: '{}' }),
 };
 

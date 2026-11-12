@@ -15,7 +15,9 @@ import * as store from './store.js';
 import { ACCEPT, attachmentBlock, readFile } from './files.js';
 import { MODES, DEFAULT_MODE_OPTS, WRITE_TYPES, TONES, LENGTHS, LANGUAGES, FILE_FORMATS, modeSystem, schemaFor } from './modes.js';
 import { companion, companionHas, sourcesBlock } from './companion.js';
-import { searchIntent, detectMode } from './intent.js';
+import { searchIntent, detectMode, detectAction } from './intent.js';
+import Folders from './components/Folders.jsx';
+import { recordUtterance, speakLocal, createLocalWake } from './localvoice.js';
 
 // ---------- small persistence helpers (per-browser conveniences; always guarded) ----------
 const load = (k, d) => {
@@ -119,6 +121,9 @@ export default function App() {
   const [wakePaused, setWakePaused] = useState(false);
   const [speechLocal, setSpeechLocal] = useState(() => storedOnDeviceStatus());
   const [wake, setWake] = useState(null);
+  const [folderInfo, setFolderInfo] = useState(null);
+  const [vstat, setVstat] = useState(null);
+  const [transcribing, setTranscribing] = useState(false);
   const install = useInstall();
 
   const abortRef = useRef(null);
@@ -132,6 +137,8 @@ export default function App() {
   const sendRef = useRef(null);
   const startMicRef = useRef(null);
   const voiceTurnRef = useRef(false);
+  const ttsRef = useRef(null);
+  const localRecRef = useRef(null);
   const micVoiceRef = useRef(false);
   const onWakeRef = useRef(null);
   const pendingRun = useRef(null);
@@ -366,6 +373,29 @@ export default function App() {
     return () => { live = false; clearInterval(i); };
   }, [cfg.ollamaEndpoint, busy, link.ok]); // eslint-disable-line
 
+  // ---------- folders and offline voice (Companion 1.2) ----------
+  const compHasFolders = companionHas(comp, 'folders');
+  const compHasVoice = companionHas(comp, 'voice');
+  const compHasActions = companionHas(comp, 'actions');
+  const refreshFolders = useCallback(async () => {
+    try { setFolderInfo(await companion.folders(cfg)); } catch { /* keep last */ }
+  }, [cfg]);
+  const folderBusy = folderInfo?.job?.state === 'running' || folderInfo?.index?.state === 'indexing';
+  useEffect(() => {
+    if (!compHasFolders) { setFolderInfo(null); return undefined; }
+    refreshFolders();
+    const i = setInterval(refreshFolders, folderBusy ? 2000 : 20000);
+    return () => clearInterval(i);
+  }, [compHasFolders, folderBusy, refreshFolders]);
+  const hasFolders = !!folderInfo?.ready?.embed_model && (folderInfo?.folders || []).some((f) => f.docs > 0);
+  useEffect(() => {
+    if (!compHasVoice) { setVstat(null); return; }
+    companion.voice(cfg).then(setVstat).catch(() => setVstat(null));
+  }, [compHasVoice, comp.version]); // eslint-disable-line
+  const voiceInstalled = !!vstat?.packages && !!vstat?.stt_ready;
+  const useLocalStt = !!cfg.localStt && compHasVoice && voiceInstalled;
+  const useLocalTts = !!cfg.localTts && compHasVoice && !!vstat?.packages && !!vstat?.voices?.some((v) => v.installed);
+
   // taskbar badge for unread scheduled results (installed app)
   useEffect(() => { setBadge(unread); }, [unread]);
 
@@ -385,7 +415,7 @@ export default function App() {
     return voices[0];
   }, [voices, cfg.voiceName]);
 
-  const speak = useCallback((text, after) => {
+  const speakBrowser = useCallback((text, after) => {
     if (!('speechSynthesis' in window) || !text) { after?.(); return; }
     window.speechSynthesis.cancel();
     const u = new SpeechSynthesisUtterance(stripMd(text).slice(0, 2500));
@@ -398,7 +428,30 @@ export default function App() {
     window.speechSynthesis.speak(u);
   }, [pickVoice]);
 
-  const hush = () => { try { window.speechSynthesis.cancel(); } catch { /* none */ } setSpeaking(false); };
+  const speak = useCallback((text, after) => {
+    if (!text) { after?.(); return; }
+    if (!useLocalTts) { speakBrowser(text, after); return; }
+    ttsRef.current?.stop();
+    let started = false;
+    const ctl = speakLocal(cfg, stripMd(text).slice(0, 2500), {
+      onStart: () => { started = true; setSpeaking(true); },
+      onLevel: (l) => { levelRef.current = l; },
+    });
+    ttsRef.current = ctl;
+    ctl.done.then((err) => {
+      if (ttsRef.current === ctl) ttsRef.current = null;
+      setSpeaking(false);
+      levelRef.current = 0;
+      if (err instanceof Error && !started) speakBrowser(text, after); // offline voice failed: fall back to the browser voice
+      else after?.();
+    });
+  }, [useLocalTts, speakBrowser, cfg]);
+
+  const hush = () => {
+    try { window.speechSynthesis.cancel(); } catch { /* none */ }
+    const t = ttsRef.current; ttsRef.current = null; t?.stop();
+    setSpeaking(false);
+  };
 
   // ---------- building the conversation for the model ----------
   const buildSystem = (extra) => {
@@ -417,6 +470,31 @@ export default function App() {
     }
     if (extra) parts.push(extra);
     return parts.join('\n\n');
+  };
+
+  // ---------- PC actions ----------
+  const runPcAction = async (q, act) => {
+    const aiId = uid();
+    const voiceTurn = voiceTurnRef.current || convoRef.current;
+    voiceTurnRef.current = false;
+    setMessages((m) => [...m, { id: uid(), role: 'user', content: q, ts: now() }, { id: aiId, role: 'assistant', content: '', pending: true, modeLabel: 'ACTION', ts: now() }]);
+    const done = (content, error) => {
+      setMessages((ms) => ms.map((m) => (m.id === aiId ? { ...m, pending: false, content, error } : m)));
+      if ((cfg.voiceReply || voiceTurn) && !error && content) speak(act.action === 'disk' ? 'Here is your disk report.' : stripMd(content).split('. ')[0], () => { if (convoRef.current) startMicRef.current?.(); });
+      else if (convoRef.current) startMicRef.current?.();
+    };
+    if (act.needTime) { done(act.say); return; }
+    if (!compHasActions) {
+      if (act.action === 'open_url') { window.open(act.args.url, '_blank', 'noopener'); done(act.say); return; }
+      done('', comp.ok ? 'PC actions need Jarvis Companion 1.2. Open SETUP → COMPANION and run the install command again to update it.' : 'PC actions need Jarvis Companion running on this PC. Open SETUP → COMPANION.');
+      return;
+    }
+    try {
+      const r = await companion.action(cfg, act.action, act.args);
+      if (act.action === 'disk') done(diskReport(r.data));
+      else if (act.action === 'remind') done(`${act.say} You’ll get a desktop notification, and it will appear in the **SCHEDULER** inbox.`);
+      else done(act.say);
+    } catch (e) { done('', e.message); }
   };
 
   const send = useCallback(async (text, opts = {}) => {
@@ -442,12 +520,18 @@ export default function App() {
       return;
     }
 
+    // PC actions: "open YouTube", "remind me at 6 pm to …", "what's taking up my disk?"
+    if ((useMode === 'auto' || (useMode === 'chat' && !opts.mode)) && !files.length) {
+      const act = detectAction(q);
+      if (act) { runPcAction(q, act); return; }
+    }
+
     // AUTO: work out the tool (and its options) from the message itself.
     let mOpts = modeOpts;
     let autoPicked = false;
     let translateOnly = '';
     if (useMode === 'auto') {
-      const d = detectMode(q, { files });
+      const d = detectMode(q, { files, hasFolders });
       translateOnly = d.text || '';
       useMode = d.mode;
       mOpts = { ...modeOpts, ...d.opts };
@@ -534,6 +618,28 @@ export default function App() {
         userContent = `${sentText}\n\nWeb sources:\n${sourcesBlock(sources)}`;
         patch({ sources });
         setActivity('SYNTHESISING');
+      }
+
+      // my files: find passages in the user's indexed folders
+      if (useMode === 'files') {
+        if (!compHasFolders) throw new Error('Answering from your folders needs Jarvis Companion 1.2. Open SETUP → COMPANION and run the install command again.');
+        setActivity('TOOL · FOLDER_SEARCH');
+        addStep(`▸ searching your folders — ${q.slice(0, 90)}`);
+        const res = await companion.folderSearch(cfg, q, 6);
+        const all = res.results || [];
+        const top = all[0]?.score || 0;
+        const hits = all.filter((r) => r.score >= Math.max(0.5, top - 0.15));
+        if (!hits.length) {
+          if (!autoPicked) throw new Error('I couldn’t find anything about that in your folders. Try other words, or check the folder is added under WORKSPACE → MY FOLDERS.');
+          addStep('✕ nothing relevant in your folders — answering normally');
+          useMode = 'chat';
+        } else {
+          sources = hits.map((r) => ({ title: `${r.name}${r.label ? ` · ${r.label}` : ''}`, url: r.path, local: true, content: r.text }));
+          addStep(`✓ ${hits.length} passage(s) from ${new Set(hits.map((h) => h.path)).size} file(s)`);
+          userContent = `${sentText}\n\nExcerpts from the user's own files:\n${sourcesBlock(sources)}`;
+          patch({ sources });
+          setActivity('SYNTHESISING');
+        }
       }
 
       // history (trimmed to fit) + current message
@@ -645,6 +751,7 @@ export default function App() {
   // ---------- voice in ----------
   const SR = typeof window !== 'undefined' && (window.SpeechRecognition || window.webkitSpeechRecognition);
   const stopMic = () => {
+    localRecRef.current?.abort(); // offline mic: finish now and use what was said
     try { recRef.current?.stop(); } catch { /* ignore */ }
     micRef.current?.stream?.getTracks().forEach((t) => t.stop());
     micRef.current?.ctx?.close?.();
@@ -652,7 +759,51 @@ export default function App() {
     setListening(false);
     levelRef.current = 0;
   };
+  // What to do with a finished phrase from the mic (browser or offline speech).
+  const handleHeard = (said) => {
+    const fromWake = micVoiceRef.current;
+    micVoiceRef.current = false;
+    if (said) {
+      emptyHeard.current = 0;
+      if (fromWake) voiceTurnRef.current = true;
+      if (convoRef.current && STOP_WORDS.test(said)) { setConvo(false); setInput(''); speak('Conversation mode off.'); return; }
+      sendRef.current?.(said);
+    } else if (convoRef.current) {
+      emptyHeard.current += 1;
+      if (emptyHeard.current >= 3) { setConvo(false); emptyHeard.current = 0; pushSys('Conversation mode paused — I didn’t hear anything for a while.', 'ok'); }
+      else setTimeout(() => startMicRef.current?.(), 250);
+    }
+  };
+
+  // Offline mic: record a phrase here, transcribe it on the PC with Whisper.
+  const startLocalMic = async () => {
+    if (localRecRef.current) return;
+    hush();
+    wake?.stop();
+    const ctl = new AbortController();
+    localRecRef.current = ctl;
+    setListening(true);
+    let wav = null;
+    try {
+      wav = await recordUtterance({ onLevel: (l) => { levelRef.current = l; }, signal: ctl.signal });
+    } catch (e) {
+      pushSys(e?.name === 'NotAllowedError' ? 'Microphone permission was blocked. Allow it from the icon left of the address bar.' : `Microphone: ${e?.message || e}`, 'warn');
+      setConvo(false);
+    }
+    localRecRef.current = null;
+    setListening(false);
+    levelRef.current = 0;
+    if (!wav) { handleHeard(''); return; }
+    setTranscribing(true);
+    let text = '';
+    try { text = ((await companion.stt(cfg, wav)).text || '').trim(); } catch (e) { pushSys(`Offline speech recognition: ${e.message}`, 'warn'); }
+    setTranscribing(false);
+    setInput(text);
+    handleHeard(text);
+  };
+
   const startMic = async () => {
+    if (useLocalStt) { startLocalMic(); return; }
     if (!SR) { pushSys('Voice input is not supported in this browser. Chrome or Edge support it.', 'warn'); setConvo(false); return; }
     if (recRef.current && listening) return;
     hush();
@@ -678,19 +829,7 @@ export default function App() {
     rec.onend = () => {
       stopMic();
       recRef.current = null;
-      const said = finalText.trim();
-      const fromWake = micVoiceRef.current;
-      micVoiceRef.current = false;
-      if (said) {
-        emptyHeard.current = 0;
-        if (fromWake) voiceTurnRef.current = true;
-        if (convoRef.current && STOP_WORDS.test(said)) { setConvo(false); setInput(''); speak('Conversation mode off.'); return; }
-        sendRef.current?.(said);
-      } else if (convoRef.current) {
-        emptyHeard.current += 1;
-        if (emptyHeard.current >= 3) { setConvo(false); emptyHeard.current = 0; pushSys('Conversation mode paused — I didn’t hear anything for a while.', 'ok'); }
-        else setTimeout(() => startMicRef.current?.(), 250);
-      }
+      handleHeard(finalText.trim());
     };
     recRef.current = rec;
     try {
@@ -718,8 +857,9 @@ export default function App() {
     setTimeout(() => startMicRef.current?.(), 300);
   };
   useEffect(() => {
-    if (!cfg.wakeWord || !SR) { setWake(null); setWakeState('off'); return undefined; }
-    const w = createWake({
+    if (!cfg.wakeWord || (!SR && !useLocalStt)) { setWake(null); setWakeState('off'); return undefined; }
+    const w = (useLocalStt ? createLocalWake : createWake)({
+      cfg,
       lang: navigator.language || 'en-US',
       local: speechLocal === 'available',
       onWake: (rest) => onWakeRef.current?.(rest),
@@ -731,8 +871,8 @@ export default function App() {
     });
     setWake(w);
     return () => w.stop();
-  }, [cfg.wakeWord, speechLocal]); // eslint-disable-line
-  const wakeWanted = !!wake && booted && !listening && !busy && !speaking && !convo && !wakePaused;
+  }, [cfg.wakeWord, speechLocal, useLocalStt]); // eslint-disable-line
+  const wakeWanted = !!wake && booted && !listening && !busy && !speaking && !convo && !wakePaused && !transcribing;
   useEffect(() => {
     if (!wake) return undefined;
     if (!wakeWanted) { wake.stop(); return undefined; }
@@ -765,11 +905,15 @@ export default function App() {
   const pendingMsg = messages.find((m) => m.pending);
   const coreState = !link.ok ? (link.checking && !link.error ? 'connecting' : 'offline')
     : listening ? 'listening'
-    : busy && !(pendingMsg && pendingMsg.content) ? 'thinking'
+    : transcribing || (busy && !(pendingMsg && pendingMsg.content)) ? 'thinking'
     : busy || speaking ? 'speaking'
     : 'standby';
-  const autoGuess = useMemo(() => (mode === 'auto' ? detectMode(input, { files: atts }) : null), [mode, input, atts]);
-  const guessLabel = !autoGuess || !input.trim() ? '' : autoGuess.mode === 'chat' ? 'CHAT'
+  const autoGuess = useMemo(() => {
+    if (mode !== 'auto') return null;
+    const act = !atts.length && detectAction(input);
+    return act ? { mode: 'action', opts: {}, act } : detectMode(input, { files: atts, hasFolders });
+  }, [mode, input, atts, hasFolders]);
+  const guessLabel = !autoGuess || !input.trim() ? '' : autoGuess.mode === 'action' ? `ACTION · ${autoGuess.act.say.replace(/[.…]$/, '')}` : autoGuess.mode === 'chat' ? 'CHAT'
     : autoGuess.mode === 'write' ? `WRITE · ${autoGuess.opts.writeType || modeOpts.writeType}`
     : autoGuess.mode === 'translate' ? `TRANSLATE → ${autoGuess.opts.language || modeOpts.language}`
     : autoGuess.mode === 'file' ? `CREATE · ${FILE_FORMATS.find((f) => f.id === autoGuess.opts.format)?.label.split(' ')[0]}`
@@ -785,6 +929,7 @@ export default function App() {
   const nextModel = pickModel(cfg, link, { mode: autoGuess ? autoGuess.mode : mode, files: atts.length > 0, length: input.length });
   const coreSub = !link.ok ? 'OPEN SETUP TO CONNECT'
     : convo && !busy && !speaking ? 'CONVERSATION'
+    : transcribing ? 'TRANSCRIBING ON THIS PC'
     : activity && busy ? activity
     : wakeState === 'armed' && !busy && !speaking && !listening ? 'SAY “JARVIS”'
     : `${brain !== 'manual' ? `${brain} · ` : ''}${nextModel || 'auto'}`.toUpperCase();
@@ -915,6 +1060,16 @@ export default function App() {
               projectFiles={projectFiles} onAddProjectFiles={addProjectFiles} onRemoveProjectFile={removeProjectFile} fileBusy={fileBusy}
               memory={memory} useMemory={cfg.useMemory} setUseMemory={(v) => setCfg({ ...cfg, useMemory: v })} onAddMemory={addMemory} onDeleteMemory={deleteMemory}
             />
+          ) : null}
+          {leftTab === 'workspace' ? (
+            <Folders
+              info={folderInfo} compOk={comp.ok} hasFeature={compHasFolders}
+              onSetup={() => companion.installExtra(cfg, 'folders').then(refreshFolders).catch((e) => pushSys(e.message, 'warn'))}
+              onAdd={async (p) => { await companion.addFolder(cfg, p); refreshFolders(); }}
+              onRemove={(p) => companion.removeFolder(cfg, p).then(refreshFolders)}
+              onReindex={() => companion.reindex(cfg).then(refreshFolders)}
+              onCompanion={() => setSettings({ open: true, tab: 'companion' })}
+            />
           ) : (
             <>
               <VitalsPanel sys={sys} loaded={loaded} hist={hist} tps={liveTps} lastTps={stats.tps} comp={comp} compHasSystem={compHasSystem} onSetup={() => setSettings({ open: true, tab: 'companion' })} />
@@ -987,7 +1142,8 @@ export default function App() {
                 </div>
               </div>
             ) : messages.map((m) => (
-              <Message key={m.id} m={m} onSpeak={(t) => speak(t)} onOpenArtifact={setArtifact} onDownloadFile={downloadFile} onExport={exportAnswer} />
+              <Message key={m.id} m={m} onSpeak={(t) => speak(t)} onOpenArtifact={setArtifact} onDownloadFile={downloadFile} onExport={exportAnswer}
+                onOpenFile={(path) => companion.action(cfg, 'open_file', { path }).catch((e) => pushSys(e.message, 'warn'))} />
             ))}
           </div>
 
@@ -998,7 +1154,7 @@ export default function App() {
                 <i className="mswitch" aria-hidden="true" />AUTO
               </button>
               {MODES.map((x) => (
-                <button key={x.id} className={`mchip ${mode === x.id ? 'mchip--on' : ''} ${x.id === 'research' && !comp.ok ? 'mchip--dim' : ''}`} onClick={() => pickMode(x.id)}
+                <button key={x.id} className={`mchip ${mode === x.id ? 'mchip--on' : ''} ${(x.id === 'research' && !comp.ok) || (x.id === 'files' && !hasFolders) ? 'mchip--dim' : ''}`} onClick={() => pickMode(x.id)}
                   title={cfg.autoMode ? `${x.hint} — use for the next message only` : x.hint} aria-pressed={mode === x.id}>{x.label}</button>
               ))}
             </div>
@@ -1112,7 +1268,8 @@ export default function App() {
             ) : null}
             <Row k="Voice" v={(pickVoice()?.name || 'system').slice(0, 22)} />
             <Row k="Mic" v={SR ? (listening ? 'LIVE' : wakeState === 'armed' ? 'WAKE WORD' : 'READY') : 'UNSUPPORTED'} tone={listening || wakeState === 'armed' ? 'ok' : undefined} />
-            <Row k="Speech" v={!SR ? '—' : speechLocal === 'available' ? 'ON THIS PC' : 'BROWSER SERVICE'} />
+            <Row k="Speech" v={useLocalStt ? 'WHISPER · THIS PC' : !SR ? '—' : speechLocal === 'available' ? 'ON THIS PC' : 'BROWSER SERVICE'} tone={useLocalStt ? 'ok' : undefined} />
+            {useLocalTts ? <Row k="Reply voice" v={(vstat?.tts_voice || '').replace(/-medium$/, '').toUpperCase()} tone="ok" /> : null}
           </Panel>
           <Scheduler cfg={cfg} online={comp.ok} onOpenRun={openRun} onSetup={() => setSettings({ open: true, tab: 'companion' })} onUnread={setUnread} />
           <Panel title="PROTOCOLS" code="CMD-04">
@@ -1157,10 +1314,20 @@ export default function App() {
         speechLocal={speechLocal}
         setSpeechLocal={setSpeechLocal}
         brainPair={brainPair}
+        onVoiceStatus={setVstat}
       />
       <ArtifactPanel artifact={artifact} onClose={() => setArtifact(null)} />
     </div>
   );
+}
+
+const GBf = (b) => (b == null ? '—' : b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : `${Math.round(b / 1e6)} MB`);
+function diskReport(d) {
+  const lines = ['**Drives**', '', '| Drive | Free | Total |', '|---|---|---|', ...(d.drives || []).map((x) => `| ${x.drive} | ${GBf(x.free)} (${Math.round((100 * x.free) / x.total)}%) | ${GBf(x.total)} |`)];
+  if (d.folders?.length) lines.push('', '**Biggest folders in your user profile**', '', '| Folder | Size |', '|---|---|', ...d.folders.slice(0, 8).map((f) => `| ${f.name} | ${GBf(f.size)} |`));
+  if (d.largest?.length) lines.push('', '**Largest files** (Downloads, Desktop, Videos, Documents)', '', '| File | Size |', '|---|---|', ...d.largest.map((f) => `| ${f.path.split(/[\\/]/).slice(-2).join('/')} | ${GBf(f.size)} |`));
+  lines.push('', d.partial ? '_Some folders were too big to measure fully in time; sizes are at least this much._' : '', 'Tip: **Downloads** and **AppData\\Local\\Temp** are usually the safest places to clean up. I can’t delete anything for you — that stays your decision.');
+  return lines.join('\n');
 }
 
 /** Tells the chat model what this app can do, so it never invents reasons for missing features. */
@@ -1168,7 +1335,7 @@ function chatAbilities(comp) {
   const search = comp?.ok && comp?.search_configured
     ? 'Web search is set up: when the user asks for current information or says "search", the app searches automatically and gives you numbered sources. The user can also pick RESEARCH above the message box.'
     : 'Web search needs Jarvis Companion with a search key (SETUP → COMPANION); it is not ready right now.';
-  return `About this app: you run locally on the user's PC. In normal chat you cannot open websites yourself. ${search} If the user asks you to search and you were not given sources, tell them to type the topic or pick RESEARCH — never claim you have no internet for privacy or security reasons. You can also read attached files and images, create Word/PowerPoint/Excel/PDF files (CREATE FILE), dashboards and artifacts, translate, and remember facts the user asks you to remember.`;
+  return `About this app: you run locally on the user's PC. In normal chat you cannot open websites yourself. ${search} If the user asks you to search and you were not given sources, tell them to type the topic or pick RESEARCH — never claim you have no internet for privacy or security reasons. You can also read attached files and images, create Word/PowerPoint/Excel/PDF files (CREATE FILE), dashboards and artifacts, translate, and remember facts the user asks you to remember. With Jarvis Companion the app also does PC actions when asked directly — "open YouTube", "open VS Code", "remind me at 6 pm to …", "volume up", "what's taking up my disk?" — and answers from folders the user added under WORKSPACE → MY FILES. If the user asks for one of these and it didn't happen, suggest the exact phrasing instead of saying you can't.`;
 }
 
 function greeting(d) {
