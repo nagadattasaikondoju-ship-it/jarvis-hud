@@ -7,11 +7,14 @@ import Settings from './components/Settings.jsx';
 import Workspace from './components/Workspace.jsx';
 import Scheduler from './components/Scheduler.jsx';
 import ArtifactPanel, { extractHtml } from './components/ArtifactPanel.jsx';
-import { DEFAULTS, probe, savings as fetchSavings, splitThinking, streamChat, baseUrl } from './api.js';
+import { DEFAULTS, probe, savings as fetchSavings, splitThinking, streamChat, baseUrl, ollamaPs, pickModel, brainModels } from './api.js';
+import { StageVitals, VitalsPanel } from './components/Vitals.jsx';
+import { createWake, chime, storedOnDeviceStatus } from './wake.js';
+import { useInstall, setBadge } from './pwa.js';
 import * as store from './store.js';
 import { ACCEPT, attachmentBlock, readFile } from './files.js';
 import { MODES, DEFAULT_MODE_OPTS, WRITE_TYPES, TONES, LENGTHS, LANGUAGES, FILE_FORMATS, modeSystem, schemaFor } from './modes.js';
-import { companion, sourcesBlock } from './companion.js';
+import { companion, companionHas, sourcesBlock } from './companion.js';
 
 // ---------- small persistence helpers (per-browser conveniences; always guarded) ----------
 const load = (k, d) => {
@@ -107,6 +110,15 @@ export default function App() {
   const [leftTab, setLeftTab] = useState(() => load('ojh.leftTab', 'workspace'));
   const [drawer, setDrawer] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  const [sys, setSys] = useState(null);
+  const [loaded, setLoaded] = useState([]);
+  const [hist, setHist] = useState({ cpu: [], gpu: [] });
+  const [liveTps, setLiveTps] = useState(null);
+  const [wakeState, setWakeState] = useState('off');
+  const [wakePaused, setWakePaused] = useState(false);
+  const [speechLocal, setSpeechLocal] = useState(() => storedOnDeviceStatus());
+  const [wake, setWake] = useState(null);
+  const install = useInstall();
 
   const abortRef = useRef(null);
   const logRef = useRef(null);
@@ -118,9 +130,15 @@ export default function App() {
   const emptyHeard = useRef(0);
   const sendRef = useRef(null);
   const startMicRef = useRef(null);
+  const voiceTurnRef = useRef(false);
+  const micVoiceRef = useRef(false);
+  const onWakeRef = useRef(null);
+  const pendingRun = useRef(null);
   const clock = useClock();
 
   const setCfg = (c) => { setCfgState(c); save('ojh.cfg', c); };
+  const cfgRef = useRef(cfg);
+  cfgRef.current = cfg;
   const project = projects.find((p) => p.id === projectId) || null;
   const setProjectId = (id) => { setProjectIdState(id); save('ojh.project', id); };
   useEffect(() => { save('ojh.mode', mode); }, [mode]);
@@ -129,6 +147,17 @@ export default function App() {
   useEffect(() => { convoRef.current = convo; }, [convo]);
 
   const pushSys = (content, level) => setMessages((m) => [...m, { id: uid(), role: 'system', content, level, ts: now() }]);
+
+  // ---------- links from the app shortcuts and notifications (?mode=…, ?run=…) ----------
+  useEffect(() => {
+    try {
+      const q = new URLSearchParams(window.location.search);
+      const m = q.get('mode');
+      if (m && MODES.some((x) => x.id === m)) setMode(m);
+      pendingRun.current = q.get('run');
+      if ([...q.keys()].length) window.history.replaceState(null, '', window.location.pathname);
+    } catch { /* ignore */ }
+  }, []);
 
   // ---------- load workspace from IndexedDB ----------
   useEffect(() => {
@@ -298,14 +327,46 @@ export default function App() {
     if (!comp.ok) return undefined;
     const t = setTimeout(() => {
       companion.setConfig(cfg, {
-        model: cfg.model || link.defaultModel || undefined,
+        model: (cfg.brain && cfg.brain !== 'manual' && cfg.mode === 'ollama' ? brainModels(cfg, link).smart : cfg.model || link.defaultModel) || undefined,
         systemPrompt: cfg.systemPrompt,
         memory: cfg.useMemory ? memory.map((m) => m.text) : [],
         ollamaUrl: cfg.ollamaEndpoint,
       }).catch(() => {});
     }, 800);
     return () => clearTimeout(t);
-  }, [comp.ok, cfg.model, cfg.systemPrompt, cfg.useMemory, cfg.ollamaEndpoint, link.defaultModel, memory]); // eslint-disable-line
+  }, [comp.ok, cfg.model, cfg.brain, cfg.smartModel, cfg.systemPrompt, cfg.useMemory, cfg.ollamaEndpoint, link.defaultModel, link.models?.length, memory]); // eslint-disable-line
+
+  // ---------- live vitals: Companion (CPU / RAM / GPU / battery) + Ollama (/api/ps) ----------
+  const compHasSystem = companionHas(comp, 'system');
+  useEffect(() => {
+    if (!compHasSystem) { setSys(null); return undefined; }
+    let live = true;
+    const pull = async () => {
+      if (document.visibilityState === 'hidden') return;
+      try {
+        const s = await companion.system(cfg);
+        if (!live) return;
+        setSys(s);
+        setHist((h) => ({ cpu: [...h.cpu.slice(-59), s.cpu?.percent ?? null], gpu: [...h.gpu.slice(-59), s.gpus?.[0]?.util ?? null] }));
+      } catch { /* keep last sample */ }
+    };
+    pull();
+    const i = setInterval(pull, 2000);
+    return () => { live = false; clearInterval(i); };
+  }, [compHasSystem, cfg.companionUrl]); // eslint-disable-line
+  useEffect(() => {
+    let live = true;
+    const pull = async () => {
+      if (document.visibilityState === 'hidden') return;
+      try { const m = await ollamaPs(cfg); if (live) setLoaded(m); } catch { if (live) setLoaded([]); }
+    };
+    pull();
+    const i = setInterval(pull, busy ? 2500 : 5000);
+    return () => { live = false; clearInterval(i); };
+  }, [cfg.ollamaEndpoint, busy, link.ok]); // eslint-disable-line
+
+  // taskbar badge for unread scheduled results (installed app)
+  useEffect(() => { setBadge(unread); }, [unread]);
 
   // ---------- voice out ----------
   useEffect(() => {
@@ -408,13 +469,17 @@ export default function App() {
     const patch = (p) => setMessages((ms) => ms.map((m) => (m.id === aiId ? { ...m, ...p } : m)));
     const addStep = (line) => setMessages((ms) => ms.map((m) => (m.id === aiId ? { ...m, steps: [...(m.steps || []), line] } : m)));
 
-    const model = cfg.model || link.defaultModel || '';
+    const model = pickModel(cfg, link, { mode: useMode, files: files.length > 0 || !!project?.fileIds?.length, length: q.length });
+    const voiceTurn = voiceTurnRef.current || !!opts.voice;
+    voiceTurnRef.current = false;
     const ctl = new AbortController();
     abortRef.current = ctl;
     const t0 = performance.now();
     let first = null;
     let raw = '';
     let rReason = '';
+    let chunks = 0;
+    let lastLive = 0;
 
     try {
       // research: gather sources through the Companion first
@@ -466,6 +531,11 @@ export default function App() {
       const { usage } = await streamChat(cfg, payload, model, ({ content, reasoning }) => {
         if ((content || reasoning) && first == null) first = performance.now() - t0;
         raw += content; rReason += reasoning;
+        if (content || reasoning) {
+          chunks += 1;
+          const t = performance.now();
+          if (t - lastLive > 500 && first != null && t - t0 - first > 300) { lastLive = t; setLiveTps(chunks / ((t - t0 - first) / 1000)); }
+        }
         if (isStructured) {
           patch({ progress: `building ${useMode === 'dashboard' ? 'dashboard' : 'file'} · ${raw.length.toLocaleString()} characters` });
           return;
@@ -491,8 +561,8 @@ export default function App() {
 
       const secs = (performance.now() - t0 - (first || 0)) / 1000;
       const toks = usage?.completion_tokens || Math.max(1, Math.round((raw.length + rReason.length) / 4));
-      const tps = secs > 0.05 ? toks / secs : null;
-      const statLine = `${model || 'default'} · ${toks} tok${tps ? ` · ${tps.toFixed(1)} tok/s` : ''} · ${((first || 0) / 1000).toFixed(2)}s to first token`;
+      const tps = usage?.tps || (secs > 0.05 ? toks / secs : null);
+      const statLine = `${model || 'default'} · ${toks} tok${tps ? ` · ${tps.toFixed(1)} tok/s` : ''} · ${((first || 0) / 1000).toFixed(2)}s to first token${usage?.load_s > 1 ? ` · ${usage.load_s.toFixed(1)}s loading model` : ''}`;
       setStats((st) => ({ replies: st.replies + 1, tokens: st.tokens + toks, tps, ttft: first }));
 
       let spoken = '';
@@ -514,7 +584,7 @@ export default function App() {
         if (html) setArtifact({ kind: 'html', html, title: q.slice(0, 60) });
         spoken = html ? 'Your artifact is ready.' : s.text;
       }
-      if ((cfg.voiceReply || convoRef.current) && spoken) speak(spoken, () => { if (convoRef.current) startMicRef.current?.(); });
+      if ((cfg.voiceReply || convoRef.current || voiceTurn) && spoken) speak(spoken, () => { if (convoRef.current) startMicRef.current?.(); });
       else if (convoRef.current) startMicRef.current?.();
     } catch (e) {
       if (e?.name === 'AbortError') patch({ pending: false, progress: '', content: raw && !isStructured ? splitThinking(raw).text : '', error: 'Interrupted.' });
@@ -523,11 +593,13 @@ export default function App() {
       if (convoRef.current) speak('Sorry, something went wrong.', () => startMicRef.current?.());
     } finally {
       setBusy(false);
+      setLiveTps(null);
       setActivity('');
       abortRef.current = null;
       levelRef.current = 0;
     }
   }, [input, busy, link, cfg, messages, speak, test, atts, mode, modeOpts, chatId, comp, memory, project, projectFiles, newChat]); // eslint-disable-line
+
   sendRef.current = send;
 
   const stop = () => { abortRef.current?.abort(); hush(); };
@@ -546,10 +618,12 @@ export default function App() {
     if (!SR) { pushSys('Voice input is not supported in this browser. Chrome or Edge support it.', 'warn'); setConvo(false); return; }
     if (recRef.current && listening) return;
     hush();
+    wake?.stop(); // only one recogniser can listen at a time; the wake word re-arms afterwards
     const rec = new SR();
     rec.lang = navigator.language || 'en-US';
     rec.interimResults = true;
     rec.continuous = false;
+    if (speechLocal === 'available') { try { rec.processLocally = true; } catch { /* unsupported */ } }
     let finalText = '';
     rec.onresult = (ev) => {
       let interim = '';
@@ -567,8 +641,11 @@ export default function App() {
       stopMic();
       recRef.current = null;
       const said = finalText.trim();
+      const fromWake = micVoiceRef.current;
+      micVoiceRef.current = false;
       if (said) {
         emptyHeard.current = 0;
+        if (fromWake) voiceTurnRef.current = true;
         if (convoRef.current && STOP_WORDS.test(said)) { setConvo(false); setInput(''); speak('Conversation mode off.'); return; }
         sendRef.current?.(said);
       } else if (convoRef.current) {
@@ -590,6 +667,40 @@ export default function App() {
     try { rec.start(); } catch { /* already started */ }
   };
   startMicRef.current = startMic;
+
+  // ---------- "Jarvis" wake word ----------
+  onWakeRef.current = (rest) => {
+    setWakePaused(true);
+    setTimeout(() => setWakePaused(false), 3000);
+    hush();
+    if (rest && STOP_WORDS.test(rest)) { stop(); return; }
+    if (rest) { voiceTurnRef.current = true; sendRef.current?.(rest); return; }
+    chime();
+    micVoiceRef.current = true;
+    setTimeout(() => startMicRef.current?.(), 300);
+  };
+  useEffect(() => {
+    if (!cfg.wakeWord || !SR) { setWake(null); setWakeState('off'); return undefined; }
+    const w = createWake({
+      lang: navigator.language || 'en-US',
+      local: speechLocal === 'available',
+      onWake: (rest) => onWakeRef.current?.(rest),
+      onState: setWakeState,
+      onFatal: () => {
+        setCfg({ ...cfgRef.current, wakeWord: false });
+        pushSys('The wake word needs the microphone. Allow it from the icon left of the address bar, then turn the wake word on again.', 'warn');
+      },
+    });
+    setWake(w);
+    return () => w.stop();
+  }, [cfg.wakeWord, speechLocal]); // eslint-disable-line
+  const wakeWanted = !!wake && booted && !listening && !busy && !speaking && !convo && !wakePaused;
+  useEffect(() => {
+    if (!wake) return undefined;
+    if (!wakeWanted) { wake.stop(); return undefined; }
+    const t = setTimeout(() => wake.start(), 700); // let a reply's speech start before re-arming
+    return () => clearTimeout(t);
+  }, [wake, wakeWanted]);
 
   const toggleConvo = () => {
     if (convo) { setConvo(false); convoRef.current = false; stopMic(); hush(); return; }
@@ -619,7 +730,14 @@ export default function App() {
     : busy && !(pendingMsg && pendingMsg.content) ? 'thinking'
     : busy || speaking ? 'speaking'
     : 'standby';
-  const coreSub = !link.ok ? 'OPEN SETUP TO CONNECT' : convo && !busy && !speaking ? 'CONVERSATION' : activity && busy ? activity : (cfg.model || link.defaultModel || 'auto').toUpperCase();
+  const brain = cfg.mode === 'ollama' ? cfg.brain || 'manual' : 'manual';
+  const brainPair = brainModels(cfg, link);
+  const nextModel = pickModel(cfg, link, { mode, files: atts.length > 0, length: input.length });
+  const coreSub = !link.ok ? 'OPEN SETUP TO CONNECT'
+    : convo && !busy && !speaking ? 'CONVERSATION'
+    : activity && busy ? activity
+    : wakeState === 'armed' && !busy && !speaking && !listening ? 'SAY “JARVIS”'
+    : `${brain !== 'manual' ? `${brain} · ` : ''}${nextModel || 'auto'}`.toUpperCase();
 
   useEffect(() => { logRef.current?.scrollTo({ top: logRef.current.scrollHeight, behavior: 'smooth' }); }, [messages]);
 
@@ -666,6 +784,15 @@ export default function App() {
     setChatId(id); save('ojh.chat', id); setMessages(msgs);
   };
 
+  useEffect(() => {
+    const id = pendingRun.current;
+    if (!id || !ready || !comp.ok) return;
+    pendingRun.current = null;
+    companion.run(cfg, id)
+      .then(({ run }) => { openRun(run); if (!run.read) companion.markRead(cfg, run.id).catch(() => {}); })
+      .catch((e) => pushSys(`Could not open that result: ${e.message}`, 'warn'));
+  }, [ready, comp.ok]); // eslint-disable-line
+
   const saved = useMemo(() => {
     if (!sav?.per_provider?.length) return null;
     const top = [...sav.per_provider].sort((a, b) => b.total_cost - a.total_cost)[0];
@@ -708,9 +835,15 @@ export default function App() {
           <span className={`pill pill--${comp.ok ? 'ok' : 'dim'}`} title="Jarvis Companion: web search + background tasks">
             <i className="led" />COMPANION{unread ? ` · ${unread} NEW` : ''}
           </span>
+          {cfg.wakeWord ? (
+            <span className={`pill pill--${wakeState === 'armed' ? 'ok' : 'dim'}`} title="Wake word: say “Jarvis” followed by your request">
+              <i className="led" />WAKE{wakeState === 'retrying' ? ' · RETRY' : ''}
+            </span>
+          ) : null}
           <span className="top__clock">{clock.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
         </div>
         <nav className="top__nav">
+          {install.canInstall ? <button className="btn btn--ghost btn--install" onClick={install.install} title="Install Jarvis as an app with its own window and desktop icon">⇩ INSTALL</button> : null}
           <button className={`btn ${!link.ok ? 'btn--pulse' : 'btn--ghost'}`} onClick={() => setSettings({ open: true, tab: 'setup' })}>SETUP</button>
           <button className="btn btn--ghost" onClick={() => setSettings({ open: true, tab: 'link' })}>CONFIG</button>
         </nav>
@@ -733,6 +866,7 @@ export default function App() {
             />
           ) : (
             <>
+              <VitalsPanel sys={sys} loaded={loaded} hist={hist} tps={liveTps} lastTps={stats.tps} comp={comp} compHasSystem={compHasSystem} onSetup={() => setSettings({ open: true, tab: 'companion' })} />
               <Panel title="SYSTEMS" code="SYS-01">
                 <Row k="Link" v={link.ok ? 'ONLINE' : 'OFFLINE'} tone={link.ok ? 'ok' : 'bad'} />
                 <Row k="Mode" v={cfg.mode === 'ollama' ? 'OLLAMA DIRECT' : 'OPENJARVIS'} />
@@ -742,7 +876,7 @@ export default function App() {
                 <Row k="Context" v={`${(cfg.maxCtx || 16384).toLocaleString()} tok`} />
                 <label className="row row--select">
                   <span>Model</span>
-                  <select value={cfg.model} onChange={(e) => setCfg({ ...cfg, model: e.target.value })} aria-label="Model">
+                  <select value={cfg.model} onChange={(e) => setCfg({ ...cfg, model: e.target.value, brain: 'manual' })} aria-label="Model">
                     <option value="">default{link.defaultModel ? ` · ${link.defaultModel}` : ''}</option>
                     {(link.models || []).map((m) => <option key={m} value={m}>{m}</option>)}
                   </select>
@@ -781,6 +915,7 @@ export default function App() {
           onDrop={(e) => { e.preventDefault(); setDragOver(false); attach([...e.dataTransfer.files]); }}
         >
           <div className="stage">
+            <StageVitals sys={sys} loaded={loaded} tps={liveTps} />
             <Core state={coreState} sub={coreSub} level={coreLevel} />
             <Waveform getLevel={getLevel} state={coreState} />
           </div>
@@ -828,6 +963,24 @@ export default function App() {
               <div className="modebar__opts">
                 <select value={modeOpts.format} onChange={mo('format')} aria-label="File format">{FILE_FORMATS.map((f) => <option key={f.id} value={f.id}>{f.label}</option>)}</select>
               </div>
+            )}
+            {cfg.mode === 'ollama' && (link.models || []).length > 0 && (
+              <label className="brain" title="FAST = quickest model, SMART = most capable model, AUTO = picks for each request">
+                <span>BRAIN</span>
+                <select
+                  value={brain === 'manual' ? `m:${cfg.model}` : brain}
+                  onChange={(e) => { const v = e.target.value; setCfg(v.startsWith('m:') ? { ...cfg, brain: 'manual', model: v.slice(2) } : { ...cfg, brain: v }); }}
+                  aria-label="Model choice"
+                >
+                  <option value="auto">AUTO · picks per task</option>
+                  <option value="fast">FAST · {brainPair.fast || '—'}</option>
+                  <option value="smart">SMART · {brainPair.smart || '—'}</option>
+                  <optgroup label="Always use">
+                    <option value="m:">default · {link.defaultModel || '—'}</option>
+                    {(link.models || []).map((m) => <option key={m} value={`m:${m}`}>{m}</option>)}
+                  </optgroup>
+                </select>
+              </label>
             )}
             {mode === 'research' && !comp.ok && (
               <div className="modebar__opts"><button className="btn btn--tiny" onClick={() => setSettings({ open: true, tab: 'companion' })}>SET UP COMPANION</button></div>
@@ -884,8 +1037,19 @@ export default function App() {
               <input type="checkbox" checked={cfg.voiceReply} onChange={(e) => { setCfg({ ...cfg, voiceReply: e.target.checked }); if (!e.target.checked) hush(); }} />
               <span>Speak replies</span>
             </label>
+            <label className="toggle">
+              <input type="checkbox" checked={!!cfg.wakeWord} disabled={!SR} onChange={(e) => setCfg({ ...cfg, wakeWord: e.target.checked })} />
+              <span>Wake word “Jarvis”</span>
+            </label>
+            {cfg.wakeWord ? (
+              <p className="muted small">
+                {wakeState === 'armed' ? <>Listening for <b>“Jarvis”</b>. Try “Jarvis, what’s the time?”</> : wakeState === 'retrying' ? 'Reconnecting to speech service…' : 'Paused while Jarvis is busy.'}
+                {speechLocal === 'available' ? ' Speech is processed on this PC.' : ' While on, your browser’s speech service hears the microphone.'}
+              </p>
+            ) : null}
             <Row k="Voice" v={(pickVoice()?.name || 'system').slice(0, 22)} />
-            <Row k="Mic" v={SR ? (listening ? 'LIVE' : 'READY') : 'UNSUPPORTED'} tone={listening ? 'ok' : undefined} />
+            <Row k="Mic" v={SR ? (listening ? 'LIVE' : wakeState === 'armed' ? 'WAKE WORD' : 'READY') : 'UNSUPPORTED'} tone={listening || wakeState === 'armed' ? 'ok' : undefined} />
+            <Row k="Speech" v={!SR ? '—' : speechLocal === 'available' ? 'ON THIS PC' : 'BROWSER SERVICE'} />
           </Panel>
           <Scheduler cfg={cfg} online={comp.ok} onOpenRun={openRun} onSetup={() => setSettings({ open: true, tab: 'companion' })} onUnread={setUnread} />
           <Panel title="PROTOCOLS" code="CMD-04">
@@ -926,6 +1090,10 @@ export default function App() {
         voices={voices}
         comp={comp}
         onCompanionRefresh={checkCompanion}
+        install={install}
+        speechLocal={speechLocal}
+        setSpeechLocal={setSpeechLocal}
+        brainPair={brainPair}
       />
       <ArtifactPanel artifact={artifact} onClose={() => setArtifact(null)} />
     </div>

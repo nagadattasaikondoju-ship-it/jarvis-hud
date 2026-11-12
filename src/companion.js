@@ -1,6 +1,10 @@
 // Client for Jarvis Companion — a tiny helper that runs on the user's PC
 // (127.0.0.1:8765). It does web search with the user's own key and runs
 // scheduled tasks in the background, even when the browser is closed.
+// Version 1.1+ also reports live system vitals and shows desktop notifications.
+
+export const COMPANION_LATEST = '1.1.0';
+export const companionHas = (comp, feature) => !!comp?.ok && Array.isArray(comp.features) && comp.features.includes(feature);
 
 const H = { 'Content-Type': 'application/json', 'X-Jarvis': '1' };
 const base = (cfg) => (cfg.companionUrl || 'http://127.0.0.1:8765').replace(/\/+$/, '');
@@ -33,6 +37,9 @@ export const companion = {
   deleteTask: (cfg, id) => call(cfg, `/tasks/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   runTask: (cfg, id) => call(cfg, `/tasks/${encodeURIComponent(id)}/run`, { method: 'POST', body: '{}' }),
   runs: (cfg) => call(cfg, '/runs'),
+  run: (cfg, id) => call(cfg, `/runs/${encodeURIComponent(id)}`),
+  system: (cfg) => call(cfg, '/system', {}, 6000),
+  testNotify: (cfg) => call(cfg, '/notify/test', { method: 'POST', body: '{}' }, 25000),
   markRead: (cfg, id) => call(cfg, `/runs/${encodeURIComponent(id)}/read`, { method: 'POST', body: '{}' }),
 };
 

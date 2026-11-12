@@ -17,6 +17,10 @@ export const DEFAULTS = {
   maxCtx: 16384,
   useMemory: true,
   companionUrl: 'http://127.0.0.1:8765',
+  brain: 'manual', // manual | auto | fast | smart
+  fastModel: '',
+  smartModel: '',
+  wakeWord: false,
 };
 
 const trim = (u) => (u || '').replace(/\/+$/, '');
@@ -50,7 +54,8 @@ export async function probe(cfg) {
       const latency = Math.round(performance.now() - t0);
       const tags = await getJSON(cfg, '/api/tags');
       const models = (tags.models || []).map((m) => m.name);
-      return { ok: true, latency, engine: `ollama ${v.version || ''}`.trim(), agent: 'direct', defaultModel: models[0] || '', models };
+      const modelInfo = (tags.models || []).map((m) => ({ name: m.name, size: m.size || 0, params: m.details?.parameter_size || '' }));
+      return { ok: true, latency, engine: `ollama ${v.version || ''}`.trim(), agent: 'direct', defaultModel: models[0] || '', models, modelInfo };
     }
     await getJSON(cfg, '/health');
     const latency = Math.round(performance.now() - t0);
@@ -69,6 +74,46 @@ export async function probe(cfg) {
   } catch (e) {
     return { ok: false, latency: null, error: describeError(e, cfg) };
   }
+}
+
+/** Models Ollama currently holds in memory, with how much of each sits in graphics memory. */
+export async function ollamaPs(cfg) {
+  const j = await getJSON({ ...cfg, mode: 'ollama' }, '/api/ps', 4000);
+  return (j.models || []).map((m) => ({
+    name: m.name || m.model,
+    size: m.size || 0,
+    vram: m.size_vram || 0,
+    ctx: m.context_length || null,
+    gpuPct: m.size ? Math.round((100 * (m.size_vram || 0)) / m.size) : 0,
+    until: m.expires_at || null,
+  }));
+}
+
+const isChatModel = (m) => !/embed|embedding|bge-|nomic-|mxbai|minilm/i.test(m.name);
+
+/** The two models the quick switch uses: FAST = smallest installed, SMART = largest (unless chosen in CONFIG). */
+export function brainModels(cfg, link) {
+  const info = (link.modelInfo || []).filter(isChatModel).sort((a, b) => a.size - b.size);
+  const has = (n) => n && (link.models || []).includes(n);
+  return {
+    fast: has(cfg.fastModel) ? cfg.fastModel : info[0]?.name || cfg.model || link.defaultModel || '',
+    smart: has(cfg.smartModel) ? cfg.smartModel : info[info.length - 1]?.name || cfg.model || link.defaultModel || '',
+  };
+}
+
+/**
+ * Pick the model for one request.
+ * AUTO: quick everyday chat and voice go to FAST; writing, files, documents, research,
+ * dashboards, artifacts and long questions go to SMART.
+ */
+export function pickModel(cfg, link, task = {}) {
+  const brain = cfg.mode === 'ollama' ? cfg.brain || 'manual' : 'manual';
+  if (brain === 'manual') return cfg.model || link.defaultModel || '';
+  const { fast, smart } = brainModels(cfg, link);
+  if (brain === 'fast') return fast;
+  if (brain === 'smart') return smart;
+  const light = (task.mode || 'chat') === 'chat' && !task.files && (task.length || 0) < 400;
+  return light ? fast : smart;
 }
 
 export function describeError(e, cfg) {
@@ -144,7 +189,14 @@ export async function streamChat(cfg, messages, model, onDelta, signal, onEvent,
     if (j.error) throw new Error(j.error);
     const m = j.message || {};
     onDelta({ content: m.content || '', reasoning: m.thinking || '' });
-    if (j.done) usage = { completion_tokens: j.eval_count || 0, prompt_tokens: j.prompt_eval_count || 0 };
+    if (j.done) {
+      usage = {
+        completion_tokens: j.eval_count || 0,
+        prompt_tokens: j.prompt_eval_count || 0,
+        tps: j.eval_count && j.eval_duration ? j.eval_count / (j.eval_duration / 1e9) : null,
+        load_s: j.load_duration ? j.load_duration / 1e9 : null,
+      };
+    }
   };
   let evName = null;
   const handleSSE = (line) => {
