@@ -21,6 +21,7 @@ export const DEFAULTS = {
   fastModel: '',
   smartModel: '',
   wakeWord: false,
+  autoResearch: true,
 };
 
 const trim = (u) => (u || '').replace(/\/+$/, '');

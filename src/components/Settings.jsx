@@ -29,7 +29,7 @@ function Copy({ text }) {
   );
 }
 
-function CompanionTab({ cfg, comp, onRefresh, origin }) {
+function CompanionTab({ cfg, setCfg, comp, onRefresh, origin }) {
   const [provider, setProvider] = useState(comp.search_provider || 'tavily');
   const [key, setKey] = useState('');
   const [msg, setMsg] = useState('');
@@ -113,7 +113,12 @@ function CompanionTab({ cfg, comp, onRefresh, origin }) {
       ) : <p className="muted">{comp.ok ? 'Update the Companion (step 01) to get desktop notifications.' : 'Install the Companion first.'}</p>}
 
       <h3><span>04</span> Use it</h3>
-      <p>Pick <b>RESEARCH</b> above the message box for cited web answers, and use the <b>SCHEDULER</b> panel for tasks like a daily morning briefing.</p>
+      <p>
+        In normal chat, Jarvis <b>searches automatically</b> when you ask for current information — “latest news about ISRO”,
+        “weather in Hyderabad today”, “search the web for …”. You can also pick <b>RESEARCH</b> above the message box for cited web answers,
+        and use the <b>SCHEDULER</b> panel for tasks like a daily morning briefing.
+      </p>
+      <label className="check"><input type="checkbox" checked={cfg.autoResearch !== false} onChange={(e) => setCfg({ ...cfg, autoResearch: e.target.checked })} /> Search the web automatically when a chat message needs current information</label>
       <details className="alt">
         <summary>Uninstall</summary>
         <p className="muted">In PowerShell run <code>Remove-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run JarvisCompanion</code> (and delete “Jarvis Companion” from <code>shell:startup</code> if it is there), then delete the folder <code>%LOCALAPPDATA%\JarvisCompanion</code> and restart your PC.</p>
@@ -198,7 +203,7 @@ export default function Settings({ open, tab: initialTab, cfg, setCfg, onClose, 
             </div>
           )}
 
-          {tab === 'companion' && <CompanionTab cfg={cfg} comp={comp} onRefresh={onCompanionRefresh} origin={origin} />}
+          {tab === 'companion' && <CompanionTab cfg={cfg} setCfg={setCfg} comp={comp} onRefresh={onCompanionRefresh} origin={origin} />}
 
           {tab === 'link' && (
             <div className="form">

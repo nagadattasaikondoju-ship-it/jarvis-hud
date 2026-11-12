@@ -15,6 +15,7 @@ import * as store from './store.js';
 import { ACCEPT, attachmentBlock, readFile } from './files.js';
 import { MODES, DEFAULT_MODE_OPTS, WRITE_TYPES, TONES, LENGTHS, LANGUAGES, FILE_FORMATS, modeSystem, schemaFor } from './modes.js';
 import { companion, companionHas, sourcesBlock } from './companion.js';
+import { searchIntent } from './intent.js';
 
 // ---------- small persistence helpers (per-browser conveniences; always guarded) ----------
 const load = (k, d) => {
@@ -420,7 +421,7 @@ export default function App() {
 
   const send = useCallback(async (text, opts = {}) => {
     const q = (text ?? input).trim();
-    const useMode = opts.mode || mode;
+    let useMode = opts.mode || mode;
     const files = opts.keepAtts ? [] : atts;
     if ((!q && !files.length) || busy) return;
     setInput('');
@@ -437,6 +438,24 @@ export default function App() {
         { id: uid(), role: 'assistant', content: `Noted. I'll remember: *${rem[1]}*. You can see or remove this under **WORKSPACE → MEMORY**.`, ts: now() }]);
       if (convoRef.current) speak('Noted. I will remember that.', () => startMicRef.current?.());
       return;
+    }
+
+    // Chat messages that need the web ("latest news on …", "search the web for …") go to RESEARCH
+    // automatically when the Companion can search. Protocol buttons (opts.mode) never do.
+    let autoResearch = false;
+    if (useMode === 'chat' && !opts.mode && !files.length && cfg.autoResearch !== false) {
+      const si = searchIntent(q);
+      if (si.search && !si.topic) {
+        const canSearch = comp.ok && comp.search_configured;
+        if (canSearch) setMode('research');
+        const reply = canSearch
+          ? 'Sure — what should I search for? I’ve switched to **RESEARCH** mode, so just type the topic (for example *“latest news about ISRO”*).'
+          : 'I can search the web through **Jarvis Companion** and your search key, but it isn’t ready on this PC right now. Open **SETUP → COMPANION** to start it, then ask again with a topic.';
+        setMessages((m) => [...m, { id: uid(), role: 'user', content: q, ts: now() }, { id: uid(), role: 'assistant', content: reply, ts: now() }]);
+        if (convoRef.current || voiceTurnRef.current) { voiceTurnRef.current = false; speak(canSearch ? 'Sure. What should I search for?' : 'Web search is not ready. Please start the Companion.', () => { if (convoRef.current) startMicRef.current?.(); }); }
+        return;
+      }
+      if (si.search && comp.ok && comp.search_configured) { useMode = 'research'; autoResearch = true; }
     }
 
     const isStructured = useMode === 'file' || useMode === 'dashboard';
@@ -456,7 +475,7 @@ export default function App() {
     const images = files.filter((a) => a.kind === 'image').map((a) => a.image);
     const sentText = [q || (images.length ? 'Describe and analyse the attached image(s).' : 'Analyse the attached file(s).'), ...textAtts.map((a) => attachmentBlock(a, per))].join('\n\n');
     const modeInfo = MODES.find((x) => x.id === useMode);
-    const modeLabel = useMode === 'chat' ? '' : useMode === 'write' ? `WRITE · ${modeOpts.writeType} · ${modeOpts.tone}` : useMode === 'translate' ? `TRANSLATE → ${modeOpts.language}` : useMode === 'file' ? `CREATE · ${FILE_FORMATS.find((f) => f.id === modeOpts.format)?.label}` : modeInfo?.label;
+    const modeLabel = autoResearch ? 'RESEARCH · AUTO' : useMode === 'chat' ? '' : useMode === 'write' ? `WRITE · ${modeOpts.writeType} · ${modeOpts.tone}` : useMode === 'translate' ? `TRANSLATE → ${modeOpts.language}` : useMode === 'file' ? `CREATE · ${FILE_FORMATS.find((f) => f.id === modeOpts.format)?.label}` : modeInfo?.label;
     const userMsg = {
       id: uid(), role: 'user', content: q, ts: now(), modeLabel, sentText,
       attachments: files.map(({ id, name, kind, size, thumb }) => ({ id, name, kind, size, thumb })),
@@ -500,7 +519,7 @@ export default function App() {
       }
 
       // history (trimmed to fit) + current message
-      const system = buildSystem(modeSystem(useMode, modeOpts));
+      const system = buildSystem(useMode === 'chat' ? chatAbilities(comp) : modeSystem(useMode, modeOpts));
       const hist = [];
       if (!isStructured) {
         let room = budget - system.length - userContent.length - 6000;
@@ -1098,6 +1117,14 @@ export default function App() {
       <ArtifactPanel artifact={artifact} onClose={() => setArtifact(null)} />
     </div>
   );
+}
+
+/** Tells the chat model what this app can do, so it never invents reasons for missing features. */
+function chatAbilities(comp) {
+  const search = comp?.ok && comp?.search_configured
+    ? 'Web search is set up: when the user asks for current information or says "search", the app searches automatically and gives you numbered sources. The user can also pick RESEARCH above the message box.'
+    : 'Web search needs Jarvis Companion with a search key (SETUP → COMPANION); it is not ready right now.';
+  return `About this app: you run locally on the user's PC. In normal chat you cannot open websites yourself. ${search} If the user asks you to search and you were not given sources, tell them to type the topic or pick RESEARCH — never claim you have no internet for privacy or security reasons. You can also read attached files and images, create Word/PowerPoint/Excel/PDF files (CREATE FILE), dashboards and artifacts, translate, and remember facts the user asks you to remember.`;
 }
 
 function greeting(d) {

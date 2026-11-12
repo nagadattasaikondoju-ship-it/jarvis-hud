@@ -73,7 +73,7 @@ Most AI assistants send everything you type to a company's servers. This one doe
 | 📁 | **Office file creation** | Ask for a **Word, PowerPoint, Excel or PDF** file and download a real formatted file, built in your browser; any answer can also be exported to .docx or .pdf |
 | 📊 | **Dashboards** | Turn a spreadsheet, CSV or pasted numbers into KPI cards and live charts; open full screen or download as a standalone HTML file |
 | ◳ | **Artifacts** | Diagrams, calculators and mini web apps generated as HTML and run in a sandboxed preview |
-| 🌐 | **Web research with citations** | Through **Jarvis Companion** and your own free Tavily or Brave key: numbered sources, inline [1] citations and a source list |
+| 🌐 | **Web research with citations** | Through **Jarvis Companion** and your own free Tavily or Brave key: numbered sources, inline [1] citations and a source list. In normal chat it **searches automatically** when a message needs current information ("latest news about …", "weather in … today", "search the web for …"); ask without a topic and Jarvis asks what to look up |
 | ⏰ | **Background scheduled tasks** | Through **Jarvis Companion**, e.g. *"every weekday at 8:00, brief me on tech news"*; runs even with the browser closed, and results land in an inbox |
 | 🖥️ | **Live vitals** | Ring gauges beside the core show your PC's **CPU, RAM, GPU and graphics memory** in real time, plus GPU temperature, battery, which model is loaded, whether it runs on the **GPU or CPU**, and live **tokens per second** (needs Companion 1.1) |
 | 🗣️ | **"Jarvis" wake word** | Turn it on in **VOICE** and say *"Jarvis, what's the time?"* from across the room, or say *"Jarvis"*, wait for the chime, then speak; it pauses while Jarvis is busy or talking |
@@ -383,6 +383,7 @@ Click the **paperclip**, drag files onto the conversation, or paste an image. Su
 | Installer says *Unable to save shortcut … Startup* | Windows Security "Controlled folder access" or antivirus blocked the Startup folder | Re-run the installer (it now uses a per-user Run entry instead) |
 | COMPANION pill is grey | The Companion isn't running | Run the installer again; check `%LOCALAPPDATA%\\JarvisCompanion\\companion.log` |
 | Research says "Add your search API key" | No key saved | **SETUP → COMPANION**: paste your Tavily or Brave key |
+| Jarvis says it can't browse the web | The message didn't look like a search (older versions only searched in RESEARCH) | Say "search the web for …" with a topic, or pick **RESEARCH** above the message box |
 | File or dashboard says "incomplete result" | The small model ran out of room or lost track | Try again with a shorter request, or raise **Max context** |
 | A PDF shows no text | It's a scanned image | Take a screenshot of the page and attach it as an image instead |
 | Non-English text looks broken in exported PDFs | PDF export uses standard fonts | Export to **Word (.docx)** for Telugu, Hindi and other scripts |
@@ -487,6 +488,7 @@ jarvis-hud/
     ├── exporters.js       # Builds .docx / .pptx / .xlsx / .pdf in the browser
     ├── companion.js       # Client for Jarvis Companion (search, tasks, inbox, vitals, notifications)
     ├── wake.js            # "Jarvis" wake word on top of the Web Speech API
+    ├── intent.js          # Spots chat messages that need a web search
     ├── pwa.js             # Service worker registration, install prompt, app badge
     └── components/
         ├── Workspace.jsx      # Projects, chats, memory
