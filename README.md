@@ -237,7 +237,7 @@ irm https://openjarvis-hud.vercel.app/companion/install.ps1 | iex
 The installer:
 1. Finds Python, or installs Python 3.13 with winget.
 2. Saves the program to `%LOCALAPPDATA%\JarvisCompanion`.
-3. Adds a **Startup** shortcut, so it starts every time you sign in.
+3. Registers it to start every time you sign in (a per-user Windows *Run* entry, with a Startup-folder shortcut as fallback; no admin needed).
 4. Starts it, and checks that it answers.
 
 macOS / Linux:
@@ -268,7 +268,7 @@ Scheduled tasks call your local Ollama model, optionally after a web search. Res
 - It answers only the HUD's own web address (CORS) and requests carrying an `X-Jarvis` header, so other websites can't use it.
 - Logs are kept in `companion.log`.
 
-**Uninstall:** press Win + R, type `shell:startup`, and delete **Jarvis Companion**. Then delete `%LOCALAPPDATA%\JarvisCompanion`.
+**Uninstall:** run `Remove-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run JarvisCompanion` in PowerShell (and delete **Jarvis Companion** from `shell:startup` if it's there). Then delete `%LOCALAPPDATA%\JarvisCompanion`.
 
 ---
 
@@ -366,7 +366,8 @@ Click the **paperclip**, drag files onto the conversation, or paste an image. Su
 | `MSVC build tools not found` (OpenJarvis install) | Missing C++ linker | Install the Build Tools (see the full Windows setup), then re-run the installer |
 | `jarvis is not recognized` | PATH not refreshed | Close PowerShell and open a new one |
 | Mic says "not supported" | The browser lacks the Web Speech API | Use Chrome or Edge |
-| COMPANION pill is grey | The Companion isn't running | Run the installer again, or start it from the Startup shortcut; check `%LOCALAPPDATA%\\JarvisCompanion\\companion.log` |
+| Installer says *Unable to save shortcut … Startup* | Windows Security "Controlled folder access" or antivirus blocked the Startup folder | Re-run the installer (it now uses a per-user Run entry instead) |
+| COMPANION pill is grey | The Companion isn't running | Run the installer again; check `%LOCALAPPDATA%\\JarvisCompanion\\companion.log` |
 | Research says "Add your search API key" | No key saved | **SETUP → COMPANION**: paste your Tavily or Brave key |
 | File or dashboard says "incomplete result" | The small model ran out of room or lost track | Try again with a shorter request, or raise **Max context** |
 | A PDF shows no text | It's a scanned image | Take a screenshot of the page and attach it as an image instead |

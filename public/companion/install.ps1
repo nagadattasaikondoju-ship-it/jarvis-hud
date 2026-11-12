@@ -4,10 +4,11 @@
 # What it does:
 #   1. Finds Python 3 (installs Python 3.13 with winget if missing)
 #   2. Downloads jarvis_companion.py to %LOCALAPPDATA%\JarvisCompanion
-#   3. Adds a shortcut to your Startup folder so it runs in the background whenever you sign in
+#   3. Registers it to start in the background whenever you sign in (per-user, no admin)
 #   4. Starts it now and checks it answers on http://127.0.0.1:8765
 #
-# Uninstall: delete "Jarvis Companion.lnk" from shell:startup and the folder %LOCALAPPDATA%\JarvisCompanion
+# Uninstall: Remove-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run JarvisCompanion
+#            (and/or delete "Jarvis Companion.lnk" from shell:startup), then delete %LOCALAPPDATA%\JarvisCompanion
 
 $ErrorActionPreference = 'Stop'
 $Site = 'https://openjarvis-hud.vercel.app'
@@ -52,18 +53,30 @@ Get-CimInstance Win32_Process -Filter "Name like 'python%'" -ErrorAction Silentl
     Where-Object { $_.CommandLine -like '*jarvis_companion.py*' } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
-# Start automatically at sign-in (Startup folder shortcut, no admin needed)
-$startup = [Environment]::GetFolderPath('Startup')
-$lnkPath = Join-Path $startup 'Jarvis Companion.lnk'
-$ws = New-Object -ComObject WScript.Shell
-$lnk = $ws.CreateShortcut($lnkPath)
-$lnk.TargetPath = $pyw
-$lnk.Arguments = '"' + (Join-Path $Dir 'jarvis_companion.py') + '"'
-$lnk.WorkingDirectory = $Dir
-$lnk.WindowStyle = 7
-$lnk.Description = 'Jarvis Companion - web search and scheduled tasks for your local Jarvis'
-$lnk.Save()
-Ok 'Will start automatically every time you sign in to Windows'
+# Start automatically at sign-in (no admin needed).
+# 1st choice: per-user Run registry key. Fallback: Startup folder shortcut.
+# (Windows Security "Controlled folder access" or antivirus can block the Startup folder.)
+$script = Join-Path $Dir 'jarvis_companion.py'
+$autostart = $false
+try {
+    Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'JarvisCompanion' -Value ('"' + $pyw + '" "' + $script + '"') -ErrorAction Stop
+    $autostart = $true
+} catch {
+    try {
+        $startup = [Environment]::GetFolderPath('Startup')
+        $ws = New-Object -ComObject WScript.Shell
+        $lnk = $ws.CreateShortcut((Join-Path $startup 'Jarvis Companion.lnk'))
+        $lnk.TargetPath = $pyw
+        $lnk.Arguments = '"' + $script + '"'
+        $lnk.WorkingDirectory = $Dir
+        $lnk.WindowStyle = 7
+        $lnk.Description = 'Jarvis Companion - web search and scheduled tasks for your local Jarvis'
+        $lnk.Save()
+        $autostart = $true
+    } catch {}
+}
+if ($autostart) { Ok 'Will start automatically every time you sign in to Windows' }
+else { Write-Host '[ warn ] Could not set up automatic start (blocked by security software). Jarvis Companion will run now; re-run this installer after a restart.' -ForegroundColor Yellow }
 
 Info 'Starting Jarvis Companion...'
 Start-Process -FilePath $pyw -ArgumentList ('"' + (Join-Path $Dir 'jarvis_companion.py') + '"') -WorkingDirectory $Dir -WindowStyle Hidden

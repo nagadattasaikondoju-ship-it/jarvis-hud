@@ -81,7 +81,7 @@ function CompanionTab({ cfg, comp, onRefresh, origin }) {
       <p>Pick <b>RESEARCH</b> above the message box for cited web answers, and use the <b>SCHEDULER</b> panel for tasks like a daily morning briefing.</p>
       <details className="alt">
         <summary>Uninstall</summary>
-        <p className="muted">Press Win + R, type <code>shell:startup</code>, delete “Jarvis Companion”, then delete the folder <code>%LOCALAPPDATA%\JarvisCompanion</code> (and restart your PC).</p>
+        <p className="muted">In PowerShell run <code>Remove-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run JarvisCompanion</code> (and delete “Jarvis Companion” from <code>shell:startup</code> if it is there), then delete the folder <code>%LOCALAPPDATA%\JarvisCompanion</code> and restart your PC.</p>
       </details>
     </div>
   );
