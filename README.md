@@ -88,6 +88,7 @@ Most AI assistants send everything you type to a company's servers. This one doe
 | 🧩 | **Reasoning trace** | When a model emits `<think>` reasoning, it's tucked into an expandable "Reasoning trace" instead of cluttering the answer |
 | 📡 | **Link telemetry** | Live connection latency with a sparkline, time to first token and tokens per second |
 | 💰 | **Efficiency panel** | In OpenJarvis mode: dollars saved compared with cloud models, tokens processed on-device and cloud energy avoided |
+| 🪄 | **AUTO mode** | No need to pick a mode: Jarvis reads your message and chooses CREATE FILE (and the format), TRANSLATE (and the language), WRITE (type and tone), DASHBOARD, ARTIFACT, RESEARCH or CHAT, instantly. Click a mode button to force it for one message |
 | ⚡ | **Protocols** | One-click commands: Status Report, Brief Me, Plan My Day, Explain Simply, Run Diagnostics |
 | 🎭 | **Persona editor** | Change Jarvis's personality with your own system prompt |
 | 🔀 | **Model switcher** | Pick any model installed on your machine |
@@ -315,6 +316,22 @@ Switch modes any time in **CONFIG → Link**.
 | PROCESSING | Blue, fast spin | Waiting for the first words; shows tool activity such as `TOOL · WEB_SEARCH` |
 | RESPONDING | Cyan, fast | Streaming or speaking a reply |
 | LINK OFFLINE / HANDSHAKE | Amber, flicker | Can't reach your local AI |
+
+### AUTO: just say what you want
+**AUTO** is on by default (the green switch at the start of the mode bar). Jarvis reads your message and picks the right tool itself; a hint under the bar shows its choice while you type, and each reply is labelled, e.g. **AUTO → CREATE · PowerPoint**.
+
+| You type | Jarvis uses |
+|---|---|
+| "make a ppt on solar energy for my class", "I need slides for…" | **CREATE FILE → PowerPoint** |
+| "create an excel sheet of my expenses", "give me this as a pdf", "…as a word document" | **CREATE FILE → Excel / PDF / Word** |
+| "translate good morning to Hindi", "how do you say thank you in Telugu" | **TRANSLATE** (language detected) |
+| "build a dashboard from this sheet", "Jan 120, Feb 135, Mar 160 — make a chart" | **DASHBOARD** |
+| "draw a flowchart of…", "build a BMI calculator", "create a quiz on…" | **ARTIFACT** |
+| "write an email to my manager…", "a funny poem about rain", "draft a short LinkedIn post…" | **WRITE** (type, tone and length detected) |
+| "latest news about ISRO", "search the web for…", "weather in Hyderabad today" | **RESEARCH** |
+| anything else, or "summarise this pdf" with a file attached | **CHAT** |
+
+Detection uses fast built-in rules (no extra AI call, no delay). To force a tool for one message, click its button; it's highlighted, and AUTO comes back after you send. Switch **AUTO** off to choose modes yourself as before.
 
 ### Modes (the chips above the message box)
 | Mode | What to type | What you get |

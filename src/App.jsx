@@ -15,7 +15,7 @@ import * as store from './store.js';
 import { ACCEPT, attachmentBlock, readFile } from './files.js';
 import { MODES, DEFAULT_MODE_OPTS, WRITE_TYPES, TONES, LENGTHS, LANGUAGES, FILE_FORMATS, modeSystem, schemaFor } from './modes.js';
 import { companion, companionHas, sourcesBlock } from './companion.js';
-import { searchIntent } from './intent.js';
+import { searchIntent, detectMode } from './intent.js';
 
 // ---------- small persistence helpers (per-browser conveniences; always guarded) ----------
 const load = (k, d) => {
@@ -102,7 +102,7 @@ export default function App() {
   const [memory, setMemory] = useState([]);
   const [fileBusy, setFileBusy] = useState(false);
   const [atts, setAtts] = useState([]);
-  const [mode, setMode] = useState(() => load('ojh.mode', 'chat'));
+  const [mode, setMode] = useState(() => (({ ...DEFAULTS, ...load('ojh.cfg', {}) }).autoMode ? 'auto' : load('ojh.mode', 'chat') === 'auto' ? 'chat' : load('ojh.mode', 'chat')));
   const [modeOpts, setModeOpts] = useState(() => ({ ...DEFAULT_MODE_OPTS, ...load('ojh.modeOpts', {}) }));
   const [artifact, setArtifact] = useState(null);
   const [convo, setConvo] = useState(false);
@@ -426,12 +426,14 @@ export default function App() {
     if ((!q && !files.length) || busy) return;
     setInput('');
     hush();
+    // In AUTO, a mode button only applies to one message.
+    if (cfg.autoMode && !opts.mode && mode !== 'auto') setMode('auto');
     let cid = chatId;
     if (!cid) cid = newChat();
 
     // "remember that …" — store locally, no model call needed
     const rem = REMEMBER.exec(q);
-    if (rem && useMode === 'chat' && !files.length) {
+    if (rem && (useMode === 'chat' || useMode === 'auto') && !files.length) {
       addMemory(rem[1].replace(/[.]$/, ''));
       setMessages((m) => [...m,
         { id: uid(), role: 'user', content: q, ts: now() },
@@ -440,22 +442,37 @@ export default function App() {
       return;
     }
 
-    // Chat messages that need the web ("latest news on …", "search the web for …") go to RESEARCH
-    // automatically when the Companion can search. Protocol buttons (opts.mode) never do.
+    // AUTO: work out the tool (and its options) from the message itself.
+    let mOpts = modeOpts;
+    let autoPicked = false;
+    let translateOnly = '';
+    if (useMode === 'auto') {
+      const d = detectMode(q, { files });
+      translateOnly = d.text || '';
+      useMode = d.mode;
+      mOpts = { ...modeOpts, ...d.opts };
+      autoPicked = true;
+    }
+
+    // Messages that need the web ("latest news on …", "search the web for …") run as research
+    // when the Companion can search. Protocol buttons (opts.mode) never do.
     let autoResearch = false;
-    if (useMode === 'chat' && !opts.mode && !files.length && cfg.autoResearch !== false) {
-      const si = searchIntent(q);
-      if (si.search && !si.topic) {
-        const canSearch = comp.ok && comp.search_configured;
-        if (canSearch) setMode('research');
+    const webAsk = autoPicked
+      ? (useMode === 'research' ? searchIntent(q) : null)
+      : (useMode === 'chat' && !opts.mode && !files.length && cfg.autoResearch !== false && searchIntent(q).search ? searchIntent(q) : null);
+    if (webAsk) {
+      const canSearch = comp.ok && comp.search_configured && cfg.autoResearch !== false;
+      if (!webAsk.topic) {
+        if (canSearch && !cfg.autoMode) setMode('research');
         const reply = canSearch
-          ? 'Sure — what should I search for? I’ve switched to **RESEARCH** mode, so just type the topic (for example *“latest news about ISRO”*).'
+          ? `Sure — what should I search for? ${cfg.autoMode ? 'Just type the topic' : 'I’ve switched to **RESEARCH** mode, so just type the topic'} (for example *“latest news about ISRO”*).`
           : 'I can search the web through **Jarvis Companion** and your search key, but it isn’t ready on this PC right now. Open **SETUP → COMPANION** to start it, then ask again with a topic.';
         setMessages((m) => [...m, { id: uid(), role: 'user', content: q, ts: now() }, { id: uid(), role: 'assistant', content: reply, ts: now() }]);
         if (convoRef.current || voiceTurnRef.current) { voiceTurnRef.current = false; speak(canSearch ? 'Sure. What should I search for?' : 'Web search is not ready. Please start the Companion.', () => { if (convoRef.current) startMicRef.current?.(); }); }
         return;
       }
-      if (si.search && comp.ok && comp.search_configured) { useMode = 'research'; autoResearch = true; }
+      if (canSearch) { useMode = 'research'; autoResearch = !autoPicked; }
+      else useMode = 'chat'; // no search available: answer from the model, which is told how to enable search
     }
 
     const isStructured = useMode === 'file' || useMode === 'dashboard';
@@ -473,9 +490,10 @@ export default function App() {
     const textAtts = files.filter((a) => a.kind !== 'image');
     const per = textAtts.length ? Math.floor((budget * 0.55) / textAtts.length) : 0;
     const images = files.filter((a) => a.kind === 'image').map((a) => a.image);
-    const sentText = [q || (images.length ? 'Describe and analyse the attached image(s).' : 'Analyse the attached file(s).'), ...textAtts.map((a) => attachmentBlock(a, per))].join('\n\n');
+    const sentText = [translateOnly ? `Translate into ${mOpts.language}:\n${translateOnly}` : q || (images.length ? 'Describe and analyse the attached image(s).' : 'Analyse the attached file(s).'), ...textAtts.map((a) => attachmentBlock(a, per))].join('\n\n');
     const modeInfo = MODES.find((x) => x.id === useMode);
-    const modeLabel = autoResearch ? 'RESEARCH · AUTO' : useMode === 'chat' ? '' : useMode === 'write' ? `WRITE · ${modeOpts.writeType} · ${modeOpts.tone}` : useMode === 'translate' ? `TRANSLATE → ${modeOpts.language}` : useMode === 'file' ? `CREATE · ${FILE_FORMATS.find((f) => f.id === modeOpts.format)?.label}` : modeInfo?.label;
+    const baseLabel = useMode === 'chat' ? '' : useMode === 'write' ? `WRITE · ${mOpts.writeType} · ${mOpts.tone}` : useMode === 'translate' ? `TRANSLATE → ${mOpts.language}` : useMode === 'file' ? `CREATE · ${FILE_FORMATS.find((f) => f.id === mOpts.format)?.label}` : modeInfo?.label;
+    const modeLabel = autoResearch ? 'RESEARCH · AUTO' : autoPicked && baseLabel ? `AUTO → ${baseLabel}` : baseLabel;
     const userMsg = {
       id: uid(), role: 'user', content: q, ts: now(), modeLabel, sentText,
       attachments: files.map(({ id, name, kind, size, thumb }) => ({ id, name, kind, size, thumb })),
@@ -519,9 +537,10 @@ export default function App() {
       }
 
       // history (trimmed to fit) + current message
-      const system = buildSystem(useMode === 'chat' ? chatAbilities(comp) : modeSystem(useMode, modeOpts));
+      // Translations get only the translation instructions: persona, date and memory distract small models.
+      const system = useMode === 'translate' ? modeSystem(useMode, mOpts) : buildSystem(useMode === 'chat' ? chatAbilities(comp) : modeSystem(useMode, mOpts));
       const hist = [];
-      if (!isStructured) {
+      if (!isStructured && useMode !== 'translate') { // each translation stands alone
         let room = budget - system.length - userContent.length - 6000;
         const prior = messages.filter((m) => (m.role === 'user' || m.role === 'assistant') && (m.content || m.sentText) && !m.error).slice(-Number(cfg.historyTurns || 0) * 2);
         for (let i = prior.length - 1; i >= 0 && room > 0; i--) {
@@ -542,7 +561,7 @@ export default function App() {
       const extra = {
         numCtx,
         forceOllama: isStructured || images.length > 0,
-        ...(isStructured ? { format: schemaFor(useMode, modeOpts), numPredict: 4096, temperature: 0.4 } : {}),
+        ...(isStructured ? { format: schemaFor(useMode, mOpts), numPredict: 4096, temperature: 0.4 } : {}),
         ...(useMode === 'artifact' ? { numPredict: 6144 } : {}),
       };
       if (chars / CHARS_PER_TOKEN > numCtx * 0.85) addStep(`⚠ input is large for the current memory size (${numCtx.toLocaleString()} tokens) — raise CONFIG → Max context if answers miss details`);
@@ -588,9 +607,9 @@ export default function App() {
       if (useMode === 'file') {
         const spec = parseJson(raw);
         const { describeSpec } = await import('./exporters.js');
-        const label = `${FILE_FORMATS.find((f) => f.id === modeOpts.format)?.label} · ${describeSpec(modeOpts.format, spec)}`;
-        patch({ pending: false, progress: '', stats: statLine, content: `Created **${spec.title || 'your file'}** — ${label}. Click **DOWNLOAD** to save it.`, file: { format: modeOpts.format, spec, label } });
-        spoken = `Your ${FILE_FORMATS.find((f) => f.id === modeOpts.format)?.label.split(' ')[0]} file is ready.`;
+        const label = `${FILE_FORMATS.find((f) => f.id === mOpts.format)?.label} · ${describeSpec(mOpts.format, spec)}`;
+        patch({ pending: false, progress: '', stats: statLine, content: `Created **${spec.title || 'your file'}** — ${label}. Click **DOWNLOAD** to save it.`, file: { format: mOpts.format, spec, label } });
+        spoken = `Your ${FILE_FORMATS.find((f) => f.id === mOpts.format)?.label.split(' ')[0]} file is ready.`;
       } else if (useMode === 'dashboard') {
         const spec = parseJson(raw);
         patch({ pending: false, progress: '', stats: statLine, content: spec.summary || 'Dashboard ready.', dashboard: spec });
@@ -749,9 +768,21 @@ export default function App() {
     : busy && !(pendingMsg && pendingMsg.content) ? 'thinking'
     : busy || speaking ? 'speaking'
     : 'standby';
+  const autoGuess = useMemo(() => (mode === 'auto' ? detectMode(input, { files: atts }) : null), [mode, input, atts]);
+  const guessLabel = !autoGuess || !input.trim() ? '' : autoGuess.mode === 'chat' ? 'CHAT'
+    : autoGuess.mode === 'write' ? `WRITE · ${autoGuess.opts.writeType || modeOpts.writeType}`
+    : autoGuess.mode === 'translate' ? `TRANSLATE → ${autoGuess.opts.language || modeOpts.language}`
+    : autoGuess.mode === 'file' ? `CREATE · ${FILE_FORMATS.find((f) => f.id === autoGuess.opts.format)?.label.split(' ')[0]}`
+    : MODES.find((x) => x.id === autoGuess.mode)?.label || '';
+  const toggleAuto = () => {
+    const on = !cfg.autoMode;
+    setCfg({ ...cfg, autoMode: on });
+    setMode(on ? 'auto' : 'chat');
+  };
+  const pickMode = (id) => setMode(cfg.autoMode && mode === id ? 'auto' : id);
   const brain = cfg.mode === 'ollama' ? cfg.brain || 'manual' : 'manual';
   const brainPair = brainModels(cfg, link);
-  const nextModel = pickModel(cfg, link, { mode, files: atts.length > 0, length: input.length });
+  const nextModel = pickModel(cfg, link, { mode: autoGuess ? autoGuess.mode : mode, files: atts.length > 0, length: input.length });
   const coreSub = !link.ok ? 'OPEN SETUP TO CONNECT'
     : convo && !busy && !speaking ? 'CONVERSATION'
     : activity && busy ? activity
@@ -828,6 +859,7 @@ export default function App() {
     : mode === 'dashboard' ? 'Attach a spreadsheet/CSV or paste numbers, then describe the dashboard…'
     : mode === 'artifact' ? 'Describe a diagram, chart, calculator or mini app…'
     : mode === 'research' ? 'Ask a question to research on the web…'
+    : mode === 'auto' ? 'Ask anything — “make a ppt on…”, “translate to Telugu…”, “latest news on…”, or attach a file…'
     : 'Give an instruction, attach a file, or press the mic…';
 
   return (
@@ -948,9 +980,9 @@ export default function App() {
                   <button className="btn" onClick={() => setSettings({ open: true, tab: 'setup' })}>CONNECT LOCAL CORE</button>
                 )}
                 <div className="chips">
-                  <button className="chip" onClick={() => { setMode('write'); setModeOpts({ ...modeOpts, writeType: 'Email' }); setInput('A polite email to my manager asking for Friday off.'); }}>✍ WRITE AN EMAIL</button>
-                  <button className="chip" onClick={() => { setMode('file'); setModeOpts({ ...modeOpts, format: 'pptx' }); setInput('A 6-slide presentation about the benefits of running AI locally.'); }}>▤ MAKE A DECK</button>
-                  <button className="chip" onClick={() => { setMode('dashboard'); setInput('Monthly sales: Jan 120, Feb 135, Mar 160, Apr 150, May 190, Jun 210. Build a sales dashboard.'); }}>◩ BUILD A DASHBOARD</button>
+                  <button className="chip" onClick={() => { if (!cfg.autoMode) { setMode('write'); setModeOpts({ ...modeOpts, writeType: 'Email' }); } setInput('Write a polite email to my manager asking for Friday off.'); }}>✍ WRITE AN EMAIL</button>
+                  <button className="chip" onClick={() => { if (!cfg.autoMode) { setMode('file'); setModeOpts({ ...modeOpts, format: 'pptx' }); } setInput('Make a 6-slide presentation about the benefits of running AI locally.'); }}>▤ MAKE A DECK</button>
+                  <button className="chip" onClick={() => { if (!cfg.autoMode) setMode('dashboard'); setInput('Monthly sales: Jan 120, Feb 135, Mar 160, Apr 150, May 190, Jun 210. Build a sales dashboard.'); }}>◩ BUILD A DASHBOARD</button>
                   <button className="chip" onClick={() => fileInRef.current?.click()}>⇪ ANALYSE A FILE</button>
                 </div>
               </div>
@@ -961,10 +993,22 @@ export default function App() {
 
           <div className="modebar" role="toolbar" aria-label="Jarvis mode">
             <div className="modebar__chips">
+              <button className={`mchip mchip--auto ${cfg.autoMode ? 'mchip--autoon' : ''}`} onClick={toggleAuto} role="switch" aria-checked={!!cfg.autoMode}
+                title={cfg.autoMode ? 'AUTO is on: Jarvis picks the tool from your message. Click to choose modes yourself.' : 'Turn on AUTO: Jarvis picks the tool from your message.'}>
+                <i className="mswitch" aria-hidden="true" />AUTO
+              </button>
               {MODES.map((x) => (
-                <button key={x.id} className={`mchip ${mode === x.id ? 'mchip--on' : ''} ${x.id === 'research' && !comp.ok ? 'mchip--dim' : ''}`} onClick={() => setMode(x.id)} title={x.hint} aria-pressed={mode === x.id}>{x.label}</button>
+                <button key={x.id} className={`mchip ${mode === x.id ? 'mchip--on' : ''} ${x.id === 'research' && !comp.ok ? 'mchip--dim' : ''}`} onClick={() => pickMode(x.id)}
+                  title={cfg.autoMode ? `${x.hint} — use for the next message only` : x.hint} aria-pressed={mode === x.id}>{x.label}</button>
               ))}
             </div>
+            {cfg.autoMode && (
+              <div className="modebar__opts autohint" aria-live="polite">
+                {mode === 'auto'
+                  ? (guessLabel ? <>Jarvis will use <b>{guessLabel}</b></> : <>Jarvis picks the tool from your message</>)
+                  : <>Next message only: <b>{MODES.find((x) => x.id === mode)?.label}</b> <button className="linkbtn" onClick={() => setMode('auto')}>back to auto</button></>}
+              </div>
+            )}
             {mode === 'write' && (
               <div className="modebar__opts">
                 <select value={modeOpts.writeType} onChange={mo('writeType')} aria-label="Type">{WRITE_TYPES.map((v) => <option key={v}>{v}</option>)}</select>

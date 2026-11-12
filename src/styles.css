@@ -555,3 +555,13 @@ code { font-family: var(--f-mono); font-size: 0.86em; }
 .linkbtn { background: none; border: 0; padding: 0; color: var(--cyan); text-decoration: underline; cursor: pointer; font: inherit; }
 .btn--install { border-color: var(--ok); color: var(--ok); }
 @media (max-width: 900px) { .btn--install { display: none; } }
+
+/* ---------- v4: AUTO mode ---------- */
+.mchip--auto { display: inline-flex; align-items: center; gap: 7px; border-color: var(--line-hi); }
+.mswitch { position: relative; width: 22px; height: 11px; border: 1px solid var(--muted); border-radius: 6px; flex-shrink: 0; transition: border-color 0.2s; }
+.mswitch::after { content: ''; position: absolute; top: 1px; left: 1px; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); transition: transform 0.2s, background 0.2s; }
+.mchip--autoon { color: var(--ok); border-color: var(--ok); background: rgba(77, 255, 176, 0.08); }
+.mchip--autoon .mswitch { border-color: var(--ok); }
+.mchip--autoon .mswitch::after { transform: translateX(11px); background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+.autohint { font-family: var(--f-mono); font-size: 11.5px; color: var(--muted); letter-spacing: 0.04em; }
+.autohint b { color: var(--ok); font-weight: 500; }

@@ -22,6 +22,7 @@ export const DEFAULTS = {
   smartModel: '',
   wakeWord: false,
   autoResearch: true,
+  autoMode: true,
 };
 
 const trim = (u) => (u || '').replace(/\/+$/, '');
