@@ -1,5 +1,13 @@
 import React, { useEffect, useState } from 'react';
-import { companion } from '../companion.js';
+import { companion, companionHas, COMPANION_LATEST } from '../companion.js';
+import { installOnDevice, onDeviceStatus } from '../wake.js';
+
+const older = (a, b) => {
+  const pa = String(a || '0').split('.').map(Number);
+  const pb = String(b || '0').split('.').map(Number);
+  for (let i = 0; i < 3; i++) { if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) < (pb[i] || 0); }
+  return false;
+};
 
 function Copy({ text }) {
   const [ok, setOk] = useState(false);
@@ -21,10 +29,21 @@ function Copy({ text }) {
   );
 }
 
-function CompanionTab({ cfg, comp, onRefresh, origin }) {
+function CompanionTab({ cfg, setCfg, comp, onRefresh, origin }) {
   const [provider, setProvider] = useState(comp.search_provider || 'tavily');
   const [key, setKey] = useState('');
   const [msg, setMsg] = useState('');
+  const [nMsg, setNMsg] = useState('');
+  const canNotify = companionHas(comp, 'notify');
+  const outdated = comp.ok && older(comp.version, COMPANION_LATEST);
+  const setNotify = async (on) => {
+    setNMsg('');
+    try { await companion.setConfig(cfg, { notify: on }); onRefresh(); } catch (e) { setNMsg(`✕ ${e.message}`); }
+  };
+  const testNotify = async () => {
+    setNMsg('Sending…');
+    try { await companion.testNotify(cfg); setNMsg('✓ Sent — look at the bottom-right corner of your screen.'); } catch (e) { setNMsg(`✕ ${e.message}`); }
+  };
   const saveKey = async () => {
     setMsg('Saving…');
     try {
@@ -46,6 +65,12 @@ function CompanionTab({ cfg, comp, onRefresh, origin }) {
         Status: <span className={`pill pill--${comp.ok ? 'ok' : 'bad'}`}>{comp.ok ? `RUNNING · v${comp.version}` : 'NOT RUNNING'}</span>{' '}
         {comp.ok && <span className={`pill pill--${comp.search_configured ? 'ok' : 'bad'}`}>{comp.search_configured ? `SEARCH READY · ${comp.search_provider}` : 'NO SEARCH KEY'}</span>}
       </p>
+      {outdated ? (
+        <div className="notice">
+          <b>Update available — v{COMPANION_LATEST}.</b> Adds live CPU / GPU / battery vitals and desktop notifications.
+          Run the install command below again in PowerShell; it replaces the old version and keeps your search key and tasks.
+        </div>
+      ) : null}
 
       <h3><span>01</span> Install (one time)</h3>
       <p className="muted">Windows PowerShell — no admin needed. It starts automatically every time you sign in.</p>
@@ -77,8 +102,23 @@ function CompanionTab({ cfg, comp, onRefresh, origin }) {
         {msg ? <p className={msg.startsWith('✕') ? 'err' : 'muted'}>{msg}</p> : null}
       </div>
 
-      <h3><span>03</span> Use it</h3>
-      <p>Pick <b>RESEARCH</b> above the message box for cited web answers, and use the <b>SCHEDULER</b> panel for tasks like a daily morning briefing.</p>
+      <h3><span>03</span> Notifications</h3>
+      {canNotify ? (
+        <div className="form">
+          <label className="check"><input type="checkbox" checked={comp.notify !== false} onChange={(e) => setNotify(e.target.checked)} /> Show a desktop notification when a scheduled task finishes (works even when this browser is closed)</label>
+          <div className="btnrow"><button className="btn btn--ghost" onClick={testNotify}>SEND TEST NOTIFICATION</button></div>
+          {nMsg ? <p className={nMsg.startsWith('✕') ? 'err' : 'muted'}>{nMsg}</p> : null}
+          <p className="muted">Clicking a notification opens that result in Jarvis. On Windows the notification is shown by Windows PowerShell; if nothing appears, check <b>Settings → System → Notifications</b> and Focus / Do not disturb.</p>
+        </div>
+      ) : <p className="muted">{comp.ok ? 'Update the Companion (step 01) to get desktop notifications.' : 'Install the Companion first.'}</p>}
+
+      <h3><span>04</span> Use it</h3>
+      <p>
+        In normal chat, Jarvis <b>searches automatically</b> when you ask for current information — “latest news about ISRO”,
+        “weather in Hyderabad today”, “search the web for …”. You can also pick <b>RESEARCH</b> above the message box for cited web answers,
+        and use the <b>SCHEDULER</b> panel for tasks like a daily morning briefing.
+      </p>
+      <label className="check"><input type="checkbox" checked={cfg.autoResearch !== false} onChange={(e) => setCfg({ ...cfg, autoResearch: e.target.checked })} /> Search the web automatically when a chat message needs current information</label>
       <details className="alt">
         <summary>Uninstall</summary>
         <p className="muted">In PowerShell run <code>Remove-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run JarvisCompanion</code> (and delete “Jarvis Companion” from <code>shell:startup</code> if it is there), then delete the folder <code>%LOCALAPPDATA%\JarvisCompanion</code> and restart your PC.</p>
@@ -87,7 +127,8 @@ function CompanionTab({ cfg, comp, onRefresh, origin }) {
   );
 }
 
-export default function Settings({ open, tab: initialTab, cfg, setCfg, onClose, onTest, link, voices, comp, onCompanionRefresh }) {
+export default function Settings({ open, tab: initialTab, cfg, setCfg, onClose, onTest, link, voices, comp, onCompanionRefresh, install, speechLocal, setSpeechLocal, brainPair }) {
+  const [dl, setDl] = useState('');
   const [tab, setTab] = useState(initialTab || 'link');
   const [draft, setDraft] = useState(cfg);
   useEffect(() => { if (open) { setDraft(cfg); setTab(initialTab || 'link'); } }, [open, initialTab]); // eslint-disable-line
@@ -150,10 +191,19 @@ export default function Settings({ open, tab: initialTab, cfg, setCfg, onClose, 
                 {link.ok ? `ONLINE · ${link.latency} ms` : 'OFFLINE'}
               </span>
               {!link.ok && link.error ? <p className="err">{link.error}</p> : null}
+
+              <h3><span>⇩</span> Install as an app (optional)</h3>
+              <p>
+                Gives Jarvis its own window, a desktop / Start-menu icon and a badge for new scheduled results.
+                The interface keeps loading even when your internet is down — the AI already runs on your PC.
+              </p>
+              {install?.installed ? <p className="muted">✓ You are using the installed app.</p>
+                : install?.canInstall ? <button className="btn" onClick={install.install}>INSTALL JARVIS</button>
+                : <p className="muted">In Chrome or Edge, click the install icon at the right end of the address bar (or menu ⋮ → <b>Cast, save and share → Install page as app</b> in Chrome, <b>Apps → Install this site as an app</b> in Edge).</p>}
             </div>
           )}
 
-          {tab === 'companion' && <CompanionTab cfg={cfg} comp={comp} onRefresh={onCompanionRefresh} origin={origin} />}
+          {tab === 'companion' && <CompanionTab cfg={cfg} setCfg={setCfg} comp={comp} onRefresh={onCompanionRefresh} origin={origin} />}
 
           {tab === 'link' && (
             <div className="form">
@@ -180,6 +230,31 @@ export default function Settings({ open, tab: initialTab, cfg, setCfg, onClose, 
                   {(link.models || []).map((m) => <option key={m} value={m}>{m}</option>)}
                 </select>
               </label>
+              {draft.mode === 'ollama' ? (
+                <>
+                  <label>Model choice <span className="muted">(also on the main screen, next to the modes)</span>
+                    <select value={draft.brain || 'manual'} onChange={up('brain')}>
+                      <option value="manual">Always use the model above</option>
+                      <option value="auto">AUTO — fast model for quick chat and voice, smart model for everything else</option>
+                      <option value="fast">FAST — always the fast model</option>
+                      <option value="smart">SMART — always the smart model</option>
+                    </select>
+                  </label>
+                  <label>Fast model
+                    <select value={draft.fastModel || ''} onChange={up('fastModel')}>
+                      <option value="">Smallest installed{brainPair?.fast && !draft.fastModel ? ` (${brainPair.fast})` : ''}</option>
+                      {(link.models || []).map((m) => <option key={m} value={m}>{m}</option>)}
+                    </select>
+                  </label>
+                  <label>Smart model
+                    <select value={draft.smartModel || ''} onChange={up('smartModel')}>
+                      <option value="">Largest installed{brainPair?.smart && !draft.smartModel ? ` (${brainPair.smart})` : ''}</option>
+                      {(link.models || []).map((m) => <option key={m} value={m}>{m}</option>)}
+                    </select>
+                  </label>
+                  <p className="muted">If your graphics card has little memory (4 GB or less), switching between two models takes a few seconds each time while the other one loads.</p>
+                </>
+              ) : null}
               <label>Max context — how much text Jarvis can read at once
                 <select value={draft.maxCtx || 16384} onChange={up('maxCtx')}>
                   <option value={4096}>4,096 tokens — lowest memory use</option>
@@ -217,6 +292,36 @@ export default function Settings({ open, tab: initialTab, cfg, setCfg, onClose, 
                   {voices.map((v) => <option key={v.name} value={v.name}>{v.name} — {v.lang}</option>)}
                 </select>
               </label>
+              <label className="check"><input type="checkbox" checked={!!draft.wakeWord} onChange={up('wakeWord')} /> Wake word — say “Jarvis …” without clicking the mic</label>
+              <p className="muted">
+                Keep this tab or the installed app open. Say <b>“Jarvis, what’s the weather like for a walk?”</b> in one go, or say <b>“Jarvis”</b>,
+                wait for the chime, then speak. It pauses while Jarvis is thinking or talking.
+              </p>
+              <p className="muted">
+                Speech recognition: <b>{speechLocal === 'available' ? 'on this PC (private)' : speechLocal === 'downloadable' || speechLocal === 'downloading' ? 'browser service — an on-device model can be downloaded' : 'your browser’s speech service'}</b>.
+                {speechLocal !== 'available' ? ' While the wake word is on, the microphone audio is sent to that service (Google for Chrome, Microsoft for Edge) to find the word “Jarvis”. Turn it off when you want full privacy.' : ''}
+              </p>
+              {speechLocal === 'unknown' ? (
+                <div className="btnrow">
+                  <button className="btn btn--ghost" onClick={async () => {
+                    setDl('Checking…');
+                    const r = await onDeviceStatus(navigator.language || 'en-US');
+                    setSpeechLocal?.(r);
+                    setDl(r === 'available' ? '✓ On-device speech is available and now in use.' : r === 'downloadable' ? 'Your browser can download on-device speech — use the button below.' : 'This browser does not offer on-device speech yet.');
+                  }}>CHECK FOR ON-DEVICE SPEECH</button>
+                </div>
+              ) : null}
+              {speechLocal === 'downloadable' ? (
+                <div className="btnrow">
+                  <button className="btn btn--ghost" onClick={async () => {
+                    setDl('Downloading…');
+                    const ok = await installOnDevice(navigator.language || 'en-US');
+                    setDl(ok ? '✓ Installed. Speech now stays on this PC.' : '✕ The browser could not install it.');
+                    if (ok) setSpeechLocal?.('available');
+                  }}>DOWNLOAD ON-DEVICE SPEECH</button>
+                </div>
+              ) : null}
+              {dl ? <p className={dl.startsWith('✕') ? 'err' : 'muted'}>{dl}</p> : null}
               <p className="muted">
                 Voices come from your operating system. The microphone uses your browser’s speech recognition
                 (in Chrome and Edge this is processed by Google or Microsoft); typed messages never leave your machine.

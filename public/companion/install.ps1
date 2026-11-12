@@ -95,7 +95,7 @@
     if ($up) {
         Ok "Jarvis Companion $($h.version) is running on http://127.0.0.1:8765"
         Write-Host ''
-        Write-Host 'Next: open the Jarvis website -> SETUP -> COMPANION and paste your search API key.' -ForegroundColor Yellow
+        Write-Host 'Next: reload the Jarvis website. If this is a new install, open SETUP -> COMPANION and paste your search API key.' -ForegroundColor Yellow
     } else {
         Fail "Companion did not start. See $Dir\companion.log"
     }

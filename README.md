@@ -73,8 +73,13 @@ Most AI assistants send everything you type to a company's servers. This one doe
 | 📁 | **Office file creation** | Ask for a **Word, PowerPoint, Excel or PDF** file and download a real formatted file, built in your browser; any answer can also be exported to .docx or .pdf |
 | 📊 | **Dashboards** | Turn a spreadsheet, CSV or pasted numbers into KPI cards and live charts; open full screen or download as a standalone HTML file |
 | ◳ | **Artifacts** | Diagrams, calculators and mini web apps generated as HTML and run in a sandboxed preview |
-| 🌐 | **Web research with citations** | Through **Jarvis Companion** and your own free Tavily or Brave key: numbered sources, inline [1] citations and a source list |
+| 🌐 | **Web research with citations** | Through **Jarvis Companion** and your own free Tavily or Brave key: numbered sources, inline [1] citations and a source list. In normal chat it **searches automatically** when a message needs current information ("latest news about …", "weather in … today", "search the web for …"); ask without a topic and Jarvis asks what to look up |
 | ⏰ | **Background scheduled tasks** | Through **Jarvis Companion**, e.g. *"every weekday at 8:00, brief me on tech news"*; runs even with the browser closed, and results land in an inbox |
+| 🖥️ | **Live vitals** | Ring gauges beside the core show your PC's **CPU, RAM, GPU and graphics memory** in real time, plus GPU temperature, battery, which model is loaded, whether it runs on the **GPU or CPU**, and live **tokens per second** (needs Companion 1.1) |
+| 🗣️ | **"Jarvis" wake word** | Turn it on in **VOICE** and say *"Jarvis, what's the time?"* from across the room, or say *"Jarvis"*, wait for the chime, then speak; it pauses while Jarvis is busy or talking |
+| 🧠 | **FAST / SMART / AUTO model switch** | The **BRAIN** menu next to the modes: FAST uses your smallest model, SMART your largest, and AUTO picks per request (quick chat → fast, documents, writing and research → smart) |
+| ⇩ | **Installable app** | Install from Chrome or Edge for its own window, a Start-menu icon and a badge for new results; the interface still loads when the internet is down |
+| 🔔 | **Desktop notifications** | When a scheduled task finishes, Windows shows a notification, even with the browser closed; clicking it opens the result |
 | 🎙️ | **Conversation mode** | Hands-free voice loop: Jarvis listens, answers aloud, then listens again; say "stop" to end |
 | 💬 | **Streaming chat** | Replies appear word by word as they're generated, rendered as formatted Markdown (lists, code, tables, links) and sanitised against injected HTML |
 | 🎤 | **Voice input** | Click the mic and speak; the transcript fills in live and sends when you stop talking |
@@ -259,9 +264,13 @@ The key is stored only in `%LOCALAPPDATA%\JarvisCompanion\config.json` on your P
 | `POST /search` | Web search through Tavily or Brave; returns titles, URLs and text snippets |
 | `GET/POST /tasks`, `DELETE /tasks/{id}` | Create, edit and delete scheduled tasks (daily, chosen weekdays, hourly, every N minutes) |
 | `POST /tasks/{id}/run` | Run a task now |
-| `GET /runs`, `POST /runs/{id}/read` | Results inbox |
+| `GET /runs`, `GET /runs/{id}`, `POST /runs/{id}/read` | Results inbox |
+| `GET /system` | Live vitals: CPU %, RAM, battery, CPU temperature (Linux), NVIDIA GPU load, memory, temperature and power (via `nvidia-smi`) — v1.1 |
+| `POST /notify/test` | Show a test desktop notification — v1.1 |
 
-Scheduled tasks call your local Ollama model, optionally after a web search. Results are stored in a local SQLite database, `jarvis.db`. If the PC was off at the scheduled time, the task runs once when the Companion next starts.
+Scheduled tasks call your local Ollama model, optionally after a web search. Results are stored in a local SQLite database, `jarvis.db`. If the PC was off at the scheduled time, the task runs once when the Companion next starts. When a task finishes, the Companion shows a desktop notification (Windows toast, macOS Notification Center, or `notify-send` on Linux); clicking it opens the result in the HUD. Turn this off in **SETUP → COMPANION**.
+
+**Updating:** run the same install command again. It replaces the program, restarts it and keeps your key, tasks and results. The HUD shows an *Update available* notice when a newer Companion exists.
 
 **Security:**
 - It listens on `127.0.0.1` only.
@@ -294,8 +303,8 @@ Switch modes any time in **CONFIG → Link**.
 
 ### Layout
 - **Top bar:** link status (green = online, with latency), clock, **SETUP** (pulses amber when offline) and **CONFIG**.
-- **Left column:** **SYSTEMS** (mode, endpoint, engine, agent, model picker), **LINK TELEMETRY** and **EFFICIENCY**.
-- **Centre:** the **core**, a waveform, the conversation log and the command bar.
+- **Left column:** **WORKSPACE** (projects, chats, memory) or **SYSTEMS** (**VITALS**, mode, endpoint, engine, agent, model picker, **LINK TELEMETRY** and **EFFICIENCY**).
+- **Centre:** the **core** flanked by live CPU / RAM / GPU / VRAM gauges, a waveform, the conversation log, the mode chips with the **BRAIN** model switch, and the command bar.
 - **Right column:** **PROTOCOLS**, **VOICE** and **SESSION** (export / purge).
 
 ### Core states
@@ -366,9 +375,15 @@ Click the **paperclip**, drag files onto the conversation, or paste an image. Su
 | `MSVC build tools not found` (OpenJarvis install) | Missing C++ linker | Install the Build Tools (see the full Windows setup), then re-run the installer |
 | `jarvis is not recognized` | PATH not refreshed | Close PowerShell and open a new one |
 | Mic says "not supported" | The browser lacks the Web Speech API | Use Chrome or Edge |
+| Wake word doesn't react | Tab closed or mic blocked, or Jarvis is busy | Keep the tab or installed app open; allow the microphone; the **WAKE** pill must be green. Say "Jarvis" clearly, then pause |
+| VITALS shows no CPU / GPU | Companion missing or older than 1.1 | Re-run the Companion install command |
+| VITALS says **100% CPU** | The model doesn't fit on the graphics card, or there's no NVIDIA GPU | Use a smaller model or lower **Max context**; update your NVIDIA driver |
+| No desktop notification | Windows notifications or Focus is off | **Settings → System → Notifications**: turn on notifications (and for Windows PowerShell); use **SEND TEST NOTIFICATION** |
+| No INSTALL button | The browser doesn't offer installing, or it's already installed | Chrome: menu ⋮ → **Cast, save and share → Install page as app**; Edge: **Apps → Install this site as an app** |
 | Installer says *Unable to save shortcut … Startup* | Windows Security "Controlled folder access" or antivirus blocked the Startup folder | Re-run the installer (it now uses a per-user Run entry instead) |
 | COMPANION pill is grey | The Companion isn't running | Run the installer again; check `%LOCALAPPDATA%\\JarvisCompanion\\companion.log` |
 | Research says "Add your search API key" | No key saved | **SETUP → COMPANION**: paste your Tavily or Brave key |
+| Jarvis says it can't browse the web | The message didn't look like a search (older versions only searched in RESEARCH) | Say "search the web for …" with a topic, or pick **RESEARCH** above the message box |
 | File or dashboard says "incomplete result" | The small model ran out of room or lost track | Try again with a shorter request, or raise **Max context** |
 | A PDF shows no text | It's a scanned image | Take a screenshot of the page and attach it as an image instead |
 | Non-English text looks broken in exported PDFs | PDF export uses standard fonts | Export to **Word (.docx)** for Telugu, Hindi and other scripts |
@@ -386,7 +401,9 @@ ollama ps                                        # loaded models, and CPU vs GPU
 
 - **Your prompts and replies never touch Vercel.** The page calls `localhost` directly from your browser.
 - **Settings and chat history** live in your browser's `localStorage`. Clear them with **PURGE** or your browser settings.
-- **Voice input:** Chrome and Edge send microphone audio to their speech service (Google or Microsoft) for transcription. Typed messages stay local.
+- **Voice input:** Chrome and Edge send microphone audio to their speech service (Google or Microsoft) for transcription. Typed messages stay local. Where the browser offers **on-device speech recognition**, the HUD uses it (VOICE shows **Speech: ON THIS PC**), and **CONFIG → VOICE** can download it.
+- **Wake word:** while it's on, the microphone stays open and, unless on-device speech is available, its audio goes to the browser's speech service to find the word "Jarvis". It's off by default; turn it off whenever you want full privacy.
+- **Vitals** are read locally by the Companion and sent only to your browser.
 - **Spoken replies** use voices installed on your device.
 - **Web search (OpenJarvis mode):** when the agent searches, the search query goes to a web search provider. The AI model itself stays local.
 - **Chats, projects, attached files and memory** are stored in your browser's IndexedDB on this computer.
@@ -451,7 +468,10 @@ jarvis-hud/
 ├── vercel.json                # Security headers for Vercel
 ├── package.json
 ├── public/
-│   └── favicon.svg
+│   ├── favicon.svg
+│   ├── manifest.webmanifest   # Installable-app manifest
+│   ├── sw.js                  # Service worker: offline shell (same-site files only)
+│   └── icons/                 # App icons (192, 512, maskable, Apple)
 ├── public/companion/
 │   ├── jarvis_companion.py    # The Companion (Python stdlib)
 │   └── install.ps1            # One-line Windows installer
@@ -466,7 +486,10 @@ jarvis-hud/
     ├── files.js           # In-browser PDF/DOCX/XLSX/CSV/image reading
     ├── modes.js           # Mode prompts + JSON schemas for files/dashboards
     ├── exporters.js       # Builds .docx / .pptx / .xlsx / .pdf in the browser
-    ├── companion.js       # Client for Jarvis Companion (search, tasks, inbox)
+    ├── companion.js       # Client for Jarvis Companion (search, tasks, inbox, vitals, notifications)
+    ├── wake.js            # "Jarvis" wake word on top of the Web Speech API
+    ├── intent.js          # Spots chat messages that need a web search
+    ├── pwa.js             # Service worker registration, install prompt, app badge
     └── components/
         ├── Workspace.jsx      # Projects, chats, memory
         ├── Scheduler.jsx      # Background tasks + results inbox
@@ -475,7 +498,8 @@ jarvis-hud/
         ├── Waveform.jsx       # Canvas audio/activity visualiser
         ├── Boot.jsx           # Start-up sequence
         ├── Message.jsx        # Chat message: Markdown, steps, reasoning trace
-        └── Settings.jsx       # SETUP / LINK / PERSONA / VOICE modal
+        ├── Vitals.jsx         # Ring gauges + VITALS panel (CPU, RAM, GPU, VRAM, model placement)
+        └── Settings.jsx       # SETUP / COMPANION / LINK / PERSONA / VOICE modal
 ```
 
 ---
@@ -553,7 +577,8 @@ vercel --prod
 - [x] Web research with citations and background scheduled tasks (Jarvis Companion)
 - [x] Hands-free conversation mode
 - [ ] User accounts and chat history synced across devices
-- [ ] Wake word ("Hey Jarvis")
+- [x] Wake word ("Jarvis"), live vitals, FAST / SMART / AUTO model switch
+- [x] Installable app with offline shell and desktop notifications
 - [ ] Fully offline speech recognition (Whisper in the browser)
 - [ ] One-click desktop app bundling Ollama + HUD
 - [ ] Own brand name and custom domain

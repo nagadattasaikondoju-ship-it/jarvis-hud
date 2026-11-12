@@ -4,14 +4,20 @@ Jarvis Companion - a small local helper for the OpenJarvis HUD.
 
   * Web search with YOUR OWN search API key (Tavily or Brave). The key stays on this PC.
   * Scheduled tasks that run in the background with your local Ollama model,
-    even when the browser is closed. Results wait in the HUD's inbox.
+    even when the browser is closed. Results wait in the HUD's inbox, and a
+    desktop notification tells you when one is ready.
+  * Live system vitals for the HUD (CPU, memory, battery, NVIDIA GPU).
 
 Standard library only (no pip installs). Listens on 127.0.0.1:8765 only, and
 only answers the HUD's own web address (CORS) plus requests carrying X-Jarvis.
 """
+import base64
 import json
 import os
+import platform
+import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -21,9 +27,11 @@ import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timedelta
+from xml.sax.saxutils import escape as xml_escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+FEATURES = ["search", "tasks", "system", "notify"]
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("JARVIS_COMPANION_PORT", "8765"))
 ALLOWED_ORIGINS = {
@@ -49,7 +57,12 @@ DEFAULT_CFG = {
     "model": "qwen3.5:2b",
     "system_prompt": "You are JARVIS, a calm, precise and slightly witty personal AI running on the user's own computer. Be concise.",
     "memory": [],
+    "notify": True,
+    "site_url": "https://openjarvis-hud.vercel.app",
 }
+IS_WIN = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
+NO_WINDOW = 0x08000000 if IS_WIN else 0  # CREATE_NO_WINDOW: no console flash under pythonw
 _lock = threading.RLock()
 
 
@@ -125,6 +138,287 @@ def init_db():
             CREATE INDEX IF NOT EXISTS runs_started ON runs(started);
             """
         )
+
+
+# ------------------------------------------------------------ system vitals
+def run_quiet(cmd, timeout=5):
+    """Run a helper program without flashing a console window; return stdout or ''."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, creationflags=NO_WINDOW)
+        return r.stdout if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+if IS_WIN:
+    import ctypes
+    from ctypes import wintypes
+
+    class _FT(ctypes.Structure):
+        _fields_ = [("lo", wintypes.DWORD), ("hi", wintypes.DWORD)]
+
+    class _MEM(ctypes.Structure):
+        _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+    class _PWR(ctypes.Structure):
+        _fields_ = [("ACLineStatus", ctypes.c_ubyte), ("BatteryFlag", ctypes.c_ubyte),
+                    ("BatteryLifePercent", ctypes.c_ubyte), ("SystemStatusFlag", ctypes.c_ubyte),
+                    ("BatteryLifeTime", wintypes.DWORD), ("BatteryFullLifeTime", wintypes.DWORD)]
+
+
+def _cpu_times():
+    """Return (idle, total) CPU time counters, or None."""
+    try:
+        if IS_WIN:
+            idle, kern, user = _FT(), _FT(), _FT()
+            if not ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kern), ctypes.byref(user)):
+                return None
+            v = lambda f: (f.hi << 32) | f.lo  # noqa: E731
+            return v(idle), v(kern) + v(user)  # kernel time already includes idle time
+        if os.path.exists("/proc/stat"):
+            with open("/proc/stat") as f:
+                nums = [int(x) for x in f.readline().split()[1:]]
+            return nums[3] + (nums[4] if len(nums) > 4 else 0), sum(nums[:8])
+    except Exception:
+        pass
+    return None
+
+
+def _memory():
+    try:
+        if IS_WIN:
+            m = _MEM()
+            m.dwLength = ctypes.sizeof(_MEM)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+            return m.ullTotalPhys, m.ullTotalPhys - m.ullAvailPhys
+        if os.path.exists("/proc/meminfo"):
+            info = {}
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    k, v = line.split(":", 1)
+                    info[k] = int(v.split()[0]) * 1024
+            return info["MemTotal"], info["MemTotal"] - info.get("MemAvailable", info.get("MemFree", 0))
+        if IS_MAC:
+            total = int(run_quiet(["sysctl", "-n", "hw.memsize"]).strip() or 0)
+            page = 4096
+            free = 0
+            for line in run_quiet(["vm_stat"]).splitlines():
+                if "page size of" in line:
+                    page = int("".join(ch for ch in line.split("page size of")[1] if ch.isdigit()) or 4096)
+                if line.startswith(("Pages free", "Pages inactive", "Pages speculative")):
+                    free += int(line.split(":")[1].strip().rstrip("."))
+            return total, total - free * page
+    except Exception:
+        pass
+    return None, None
+
+
+def _battery():
+    try:
+        if IS_WIN:
+            p = _PWR()
+            if not ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(p)):
+                return None
+            if p.BatteryFlag == 128 or p.BatteryLifePercent == 255:  # no battery / unknown
+                return None
+            return {"percent": int(p.BatteryLifePercent), "plugged": p.ACLineStatus == 1}
+        base = "/sys/class/power_supply"
+        if os.path.isdir(base):
+            for name in sorted(os.listdir(base)):
+                if name.startswith("BAT"):
+                    with open(os.path.join(base, name, "capacity")) as f:
+                        pct = int(f.read().strip())
+                    with open(os.path.join(base, name, "status")) as f:
+                        status = f.read().strip()
+                    return {"percent": pct, "plugged": status != "Discharging"}
+        if IS_MAC:
+            out = run_quiet(["pmset", "-g", "batt"])
+            if "%" in out:
+                pct = int(out.split("%")[0].split()[-1])
+                return {"percent": pct, "plugged": "AC Power" in out}
+    except Exception:
+        pass
+    return None
+
+
+def _cpu_name():
+    try:
+        if IS_WIN:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as k:
+                return winreg.QueryValueEx(k, "ProcessorNameString")[0].strip()
+        if os.path.exists("/proc/cpuinfo"):
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if line.startswith("model name"):
+                        return line.split(":", 1)[1].strip()
+        if IS_MAC:
+            return run_quiet(["sysctl", "-n", "machdep.cpu.brand_string"]).strip() or platform.processor()
+    except Exception:
+        pass
+    return platform.processor() or platform.machine()
+
+
+def _cpu_temp():
+    """CPU temperature where it can be read without admin rights (Linux). Windows needs admin, so None."""
+    try:
+        base = "/sys/class/thermal"
+        if os.path.isdir(base):
+            best = None
+            for z in sorted(os.listdir(base)):
+                tp = os.path.join(base, z, "type")
+                if not os.path.exists(tp):
+                    continue
+                with open(tp) as f:
+                    kind = f.read().strip()
+                with open(os.path.join(base, z, "temp")) as f:
+                    c = int(f.read().strip()) / 1000
+                if kind in ("x86_pkg_temp", "cpu-thermal", "k10temp", "coretemp"):
+                    return round(c)
+                best = best if best is not None else round(c)
+            return best
+    except Exception:
+        pass
+    return None
+
+
+def _nvidia_smi():
+    exe = shutil.which("nvidia-smi")
+    if not exe and IS_WIN:
+        for c in (os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "nvidia-smi.exe"),
+                  os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "NVIDIA Corporation", "NVSMI", "nvidia-smi.exe")):
+            if os.path.exists(c):
+                return c
+    return exe
+
+
+def _num(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _gpus():
+    exe = _nvidia_smi()
+    if not exe:
+        return []
+    out = run_quiet([exe, "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
+                     "--format=csv,noheader,nounits"], timeout=6)
+    gpus = []
+    for line in out.strip().splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if len(f) < 5:
+            continue
+        gpus.append({
+            "name": f[0], "util": _num(f[1]), "mem_used_mb": _num(f[2]), "mem_total_mb": _num(f[3]),
+            "temp_c": _num(f[4]), "power_w": _num(f[5]) if len(f) > 5 else None,
+        })
+    return gpus
+
+
+class Vitals:
+    """Samples vitals on demand (never more than about once a second) and caches the slow GPU query."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.prev = _cpu_times()
+        self.prev_at = time.time()
+        self.cpu_pct = None
+        self.gpu = []
+        self.gpu_at = 0.0
+        self.gpu_missing_at = 0.0
+        self.cpu_name = None
+        self.cache = None
+        self.cache_at = 0.0
+
+    def snapshot(self):
+        with self.lock:
+            now = time.time()
+            if self.cache and now - self.cache_at < 0.9:
+                return self.cache
+            cur = _cpu_times()
+            if cur and self.prev:
+                d_idle, d_total = cur[0] - self.prev[0], cur[1] - self.prev[1]
+                if d_total > 0:
+                    self.cpu_pct = max(0.0, min(100.0, 100.0 * (1 - d_idle / d_total)))
+            elif cur and not self.prev:
+                time.sleep(0.25)
+                nxt = _cpu_times()
+                if nxt and nxt[1] - cur[1] > 0:
+                    self.cpu_pct = max(0.0, min(100.0, 100.0 * (1 - (nxt[0] - cur[0]) / (nxt[1] - cur[1]))))
+                cur = nxt
+            self.prev = cur
+            # GPU: refresh every ~2 s; if there is no NVIDIA GPU, only look again once a minute.
+            if now - self.gpu_at > 1.8 and (self.gpu or now - self.gpu_missing_at > 60):
+                self.gpu = _gpus()
+                self.gpu_at = now
+                if not self.gpu:
+                    self.gpu_missing_at = now
+            if self.cpu_name is None:
+                self.cpu_name = _cpu_name()
+            total, used = _memory()
+            self.cache = {
+                "ok": True, "time": now, "platform": platform.system(), "host": platform.node(),
+                "cpu": {"percent": None if self.cpu_pct is None else round(self.cpu_pct, 1),
+                        "cores": os.cpu_count(), "name": self.cpu_name, "temp_c": _cpu_temp()},
+                "ram": {"total": total, "used": used,
+                        "percent": round(100.0 * used / total, 1) if total else None},
+                "battery": _battery(),
+                "gpus": self.gpu,
+            }
+            self.cache_at = now
+            return self.cache
+
+
+VITALS = Vitals()
+
+
+# ----------------------------------------------------------- notifications
+def _plain(text, limit):
+    t = " ".join((text or "").replace("#", " ").replace("*", "").replace("`", "").split())
+    return t if len(t) <= limit else t[: limit - 1] + "…"
+
+
+def notify(title, body, url=None):
+    """Show a desktop notification. Returns True when it was handed to the OS."""
+    title, body = _plain(title, 64), _plain(body, 180)
+    try:
+        if IS_WIN:
+            launch = ' activationType="protocol" launch="' + xml_escape(url, {'"': "&quot;"}) + '"' if url else ""
+            xml = (f'<toast{launch}><visual><binding template="ToastGeneric">'
+                   f"<text>{xml_escape(title)}</text><text>{xml_escape(body)}</text>"
+                   f"</binding></visual></toast>")
+            ps = (
+                "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null;"
+                "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null;"
+                "$x = New-Object Windows.Data.Xml.Dom.XmlDocument;"
+                "$x.LoadXml([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('"
+                + base64.b64encode(xml.encode("utf-8")).decode() + "')));"
+                "$t = New-Object Windows.UI.Notifications.ToastNotification $x;"
+                "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("
+                "'{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe').Show($t)"
+            )
+            enc = base64.b64encode(ps.encode("utf-16-le")).decode()
+            r = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", enc],
+                               capture_output=True, timeout=20, creationflags=NO_WINDOW)
+            if r.returncode != 0:
+                log("notify failed", r.stderr.decode("utf-8", "replace")[:400])
+            return r.returncode == 0
+        if IS_MAC:
+            q = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')  # noqa: E731
+            return subprocess.run(["osascript", "-e", f'display notification "{q(body)}" with title "{q(title)}"'],
+                                  capture_output=True, timeout=10).returncode == 0
+        exe = shutil.which("notify-send")
+        if exe:
+            return subprocess.run([exe, "-a", "Jarvis", title, body], capture_output=True, timeout=10).returncode == 0
+    except Exception:
+        log("notify error", traceback.format_exc())
+    return False
 
 
 # ------------------------------------------------------------------ search
@@ -246,6 +540,11 @@ def run_task(task):
         con.execute("UPDATE tasks SET last_run=? WHERE id=?", (time.time(), task["id"]))
         con.execute("DELETE FROM runs WHERE id NOT IN (SELECT id FROM runs ORDER BY started DESC LIMIT 200)")
     log("task", task["name"], status)
+    cfg = load_cfg()
+    if cfg.get("notify", True):
+        site = (cfg.get("site_url") or DEFAULT_CFG["site_url"]).rstrip("/")
+        notify(("Jarvis · " if status == "done" else "Jarvis · failed: ") + task["name"],
+               output or "No output.", f"{site}/?run={rid}")
 
 
 def scheduler_loop():
@@ -328,7 +627,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {
                     "ok": True, "version": VERSION, "search_configured": bool(cfg.get("search_key")),
                     "search_provider": cfg.get("search_provider"), "model": cfg.get("model"), "home": HOME,
+                    "features": FEATURES, "notify": bool(cfg.get("notify", True)), "platform": platform.system(),
                 })
+            if path == "/system":
+                return self._send(200, VITALS.snapshot())
             if path == "/tasks":
                 with db() as con:
                     rows = [row_task(r) for r in con.execute("SELECT * FROM tasks ORDER BY created")]
@@ -340,6 +642,13 @@ class Handler(BaseHTTPRequestHandler):
                         for r in con.execute("SELECT * FROM runs ORDER BY started DESC LIMIT 50")
                     ]
                 return self._send(200, {"runs": rows})
+            parts = path.strip("/").split("/")
+            if len(parts) == 2 and parts[0] == "runs":
+                with db() as con:
+                    r = con.execute("SELECT * FROM runs WHERE id=?", (parts[1],)).fetchone()
+                if not r:
+                    return self._send(404, {"error": "No such result"})
+                return self._send(200, {"run": {**dict(r), "sources": json.loads(r["sources"] or "[]"), "read": bool(r["read"])}})
             self._send(404, {"error": "Not found"})
         except Exception as e:  # noqa: BLE001
             log("GET error", path, traceback.format_exc())
@@ -363,10 +672,19 @@ class Handler(BaseHTTPRequestHandler):
                     cfg["ollama_url"] = str(body["ollamaUrl"])
                 if "systemPrompt" in body:
                     cfg["system_prompt"] = str(body["systemPrompt"] or "")
+                if isinstance(body.get("notify"), bool):
+                    cfg["notify"] = body["notify"]
+                origin = self.headers.get("Origin")
+                if origin in ALLOWED_ORIGINS:
+                    cfg["site_url"] = origin
                 if isinstance(body.get("memory"), list):
                     cfg["memory"] = [str(m)[:500] for m in body["memory"][:100]]
                 save_cfg(cfg)
                 return self._send(200, {"ok": True, "search_configured": bool(cfg.get("search_key"))})
+            if path == "/notify/test":
+                site = (load_cfg().get("site_url") or DEFAULT_CFG["site_url"]).rstrip("/")
+                ok = notify("Jarvis", "Notifications are working. Scheduled task results will appear like this.", site)
+                return self._send(200 if ok else 500, {"ok": ok} if ok else {"error": "Your system did not accept the notification. On Windows, check Settings > System > Notifications."})
             if path == "/search":
                 q = str(body.get("query") or "").strip()
                 if not q:
