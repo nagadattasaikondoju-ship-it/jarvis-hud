@@ -565,3 +565,18 @@ code { font-family: var(--f-mono); font-size: 0.86em; }
 .mchip--autoon .mswitch::after { transform: translateX(11px); background: var(--ok); box-shadow: 0 0 6px var(--ok); }
 .autohint { font-family: var(--f-mono); font-size: 11.5px; color: var(--muted); letter-spacing: 0.04em; }
 .autohint b { color: var(--ok); font-weight: 500; }
+
+/* ---------- v5: folders, actions, offline voice ---------- */
+.ws__list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.ws__list li { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 4px 6px; border: 1px solid rgba(63, 224, 255, 0.12); }
+.ws__list .ws__name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ws__list em { font-style: normal; font-family: var(--f-mono); font-size: 10.5px; color: var(--muted); white-space: nowrap; }
+.chips--left { justify-content: flex-start; margin-top: 8px; gap: 6px; }
+.chip--tiny { padding: 4px 8px; font-size: 9.5px; letter-spacing: 0.12em; }
+.job { display: grid; gap: 4px; margin-top: 8px; font-size: 12.5px; }
+.job__bar { height: 4px; background: rgba(63, 224, 255, 0.12); overflow: hidden; }
+.job__bar i { display: block; height: 100%; background: var(--cyan); box-shadow: 0 0 6px var(--cyan); transition: width 0.4s; min-width: 4%; }
+.job em { font-style: normal; font-family: var(--f-mono); font-size: 10.5px; color: var(--muted); }
+.sources .src-open { margin-left: 8px; }
+.disk { width: 100%; border-collapse: collapse; font-size: 13px; }
+.voice-grid { display: grid; gap: 10px; }

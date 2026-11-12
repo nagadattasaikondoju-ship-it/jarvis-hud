@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { companion, companionHas, COMPANION_LATEST } from '../companion.js';
 import { installOnDevice, onDeviceStatus } from '../wake.js';
+import VoiceSetup from './VoiceSetup.jsx';
 
 const older = (a, b) => {
   const pa = String(a || '0').split('.').map(Number);
@@ -127,7 +128,7 @@ function CompanionTab({ cfg, setCfg, comp, onRefresh, origin }) {
   );
 }
 
-export default function Settings({ open, tab: initialTab, cfg, setCfg, onClose, onTest, link, voices, comp, onCompanionRefresh, install, speechLocal, setSpeechLocal, brainPair }) {
+export default function Settings({ open, tab: initialTab, cfg, setCfg, onClose, onTest, link, voices, comp, onCompanionRefresh, install, speechLocal, setSpeechLocal, brainPair, onVoiceStatus }) {
   const [dl, setDl] = useState('');
   const [tab, setTab] = useState(initialTab || 'link');
   const [draft, setDraft] = useState(cfg);
@@ -322,6 +323,8 @@ export default function Settings({ open, tab: initialTab, cfg, setCfg, onClose, 
                 </div>
               ) : null}
               {dl ? <p className={dl.startsWith('✕') ? 'err' : 'muted'}>{dl}</p> : null}
+              <VoiceSetup cfg={cfg} draft={draft} setDraft={setDraft} comp={comp} onStatus={onVoiceStatus} />
+              <div className="ws__label">Browser voice</div>
               <p className="muted">
                 Voices come from your operating system. The microphone uses your browser’s speech recognition
                 (in Chrome and Edge this is processed by Google or Microsoft); typed messages never leave your machine.

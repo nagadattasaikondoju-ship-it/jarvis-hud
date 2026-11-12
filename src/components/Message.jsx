@@ -14,7 +14,7 @@ function Md({ text }) {
 const fmtTime = (ts) => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 const FILE_ICON = { docx: 'W', pptx: 'P', xlsx: 'X', pdf: 'PDF' };
 
-export default function Message({ m, onSpeak, onOpenArtifact, onDownloadFile, onExport }) {
+export default function Message({ m, onSpeak, onOpenArtifact, onDownloadFile, onExport, onOpenFile }) {
   const [showR, setShowR] = useState(false);
   if (m.role === 'system') {
     return (
@@ -103,7 +103,11 @@ export default function Message({ m, onSpeak, onOpenArtifact, onDownloadFile, on
       {m.sources?.length ? (
         <ol className="sources">
           {m.sources.map((s, i) => (
-            <li key={i}><a href={s.url} target="_blank" rel="noreferrer">{s.title || s.url}</a><span>{(() => { try { return new URL(s.url).hostname.replace(/^www\./, ''); } catch { return ''; } })()}</span></li>
+            s.local ? (
+              <li key={i}><span className="src-local" title={s.url}>📄 {s.title}</span>{onOpenFile ? <button className="msg__btn src-open" onClick={() => onOpenFile(s.url)}>OPEN</button> : null}</li>
+            ) : (
+              <li key={i}><a href={s.url} target="_blank" rel="noreferrer">{s.title || s.url}</a><span>{(() => { try { return new URL(s.url).hostname.replace(/^www\./, ''); } catch { return ''; } })()}</span></li>
+            )
           ))}
         </ol>
       ) : null}
