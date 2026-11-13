@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { companion, companionHas, COMPANION_LATEST } from '../companion.js';
 import { installOnDevice, onDeviceStatus } from '../wake.js';
 import VoiceSetup from './VoiceSetup.jsx';
+import HeyJarvisSetup from './HeyJarvisSetup.jsx';
 
 const older = (a, b) => {
   const pa = String(a || '0').split('.').map(Number);
@@ -128,7 +129,8 @@ function CompanionTab({ cfg, setCfg, comp, onRefresh, origin }) {
   );
 }
 
-export default function Settings({ open, tab: initialTab, cfg, setCfg, onClose, onTest, link, voices, comp, onCompanionRefresh, install, speechLocal, setSpeechLocal, brainPair, onVoiceStatus }) {
+export default function Settings({ open, tab: initialTab, cfg, setCfg, onClose, onTest, link, voices, comp, onCompanionRefresh, install, speechLocal, setSpeechLocal, brainPair, onVoiceStatus, onHotwordStatus }) {
+  const [voiceReady, setVoiceReady] = useState(false);
   const [dl, setDl] = useState('');
   const [tab, setTab] = useState(initialTab || 'link');
   const [draft, setDraft] = useState(cfg);
@@ -323,7 +325,8 @@ export default function Settings({ open, tab: initialTab, cfg, setCfg, onClose, 
                 </div>
               ) : null}
               {dl ? <p className={dl.startsWith('✕') ? 'err' : 'muted'}>{dl}</p> : null}
-              <VoiceSetup cfg={cfg} draft={draft} setDraft={setDraft} comp={comp} onStatus={onVoiceStatus} />
+              <VoiceSetup cfg={cfg} draft={draft} setDraft={setDraft} comp={comp} onStatus={(v) => { setVoiceReady(!!v?.packages && !!v?.stt_ready); onVoiceStatus?.(v); }} />
+              <HeyJarvisSetup cfg={cfg} comp={comp} voiceReady={voiceReady} onStatus={onHotwordStatus} />
               <div className="ws__label">Browser voice</div>
               <p className="muted">
                 Voices come from your operating system. The microphone uses your browser’s speech recognition

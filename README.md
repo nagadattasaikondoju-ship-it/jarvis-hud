@@ -90,6 +90,7 @@ Most AI assistants send everything you type to a company's servers. This one doe
 | 💰 | **Efficiency panel** | In OpenJarvis mode: dollars saved compared with cloud models, tokens processed on-device and cloud energy avoided |
 | 📁 | **Chat with your folders** | Add folders such as Documents under **WORKSPACE → MY FOLDERS**. Jarvis indexes PDF, Word, PowerPoint, Excel, text and code files **on your PC** with a small embedding model (`nomic-embed-text`, ~275 MB) and answers questions like *"what did my physics notes say about the exam?"* with citations and an **OPEN** button for each file |
 | 🖱️ | **PC actions** | *"Open YouTube"*, *"open VS Code"*, *"play lofi on YouTube"*, *"volume up"*, *"pause"*, *"lock my PC"*, *"remind me at 6 pm to call mom"*, *"what's taking up my disk?"*. Only a fixed list of safe actions exists; nothing deletes files or runs typed commands |
+| 🎙️ | **"Hey Jarvis" with nothing open** | The Companion listens in the background (openWakeWord's ONNX models, on your PC). Say *"Hey Jarvis"* and it answers *"Yes?"*, opens or focuses the Jarvis window, hears your request (with offline voice) and Jarvis answers aloud. Sensitivity, pause and start-with-Windows in **CONFIG → VOICE** |
 | 🔇 | **Fully offline voice** | Optional: **Whisper** (speech to text) and **Piper** (natural voices, including Telugu, Hindi and Malayalam) run on your PC through the Companion, for the mic, conversation mode and the wake word. Set up in **CONFIG → VOICE** (~1 GB download) |
 | 🪄 | **AUTO mode** | No need to pick a mode: Jarvis reads your message and chooses CREATE FILE (and the format), TRANSLATE (and the language), WRITE (type and tone), DASHBOARD, ARTIFACT, RESEARCH or CHAT, instantly. Click a mode button to force it for one message |
 | ⚡ | **Protocols** | One-click commands: Status Report, Brief Me, Plan My Day, Explain Simply, Run Diagnostics |
@@ -275,6 +276,9 @@ The key is stored only in `%LOCALAPPDATA%\JarvisCompanion\config.json` on your P
 | `GET/POST /folders`, `POST /folders/remove`, `POST /folders/reindex`, `POST /folders/search` | Folders to index, index status, semantic search over your files — v1.2 |
 | `POST /actions/run` | One action from a fixed list: `open_url` (http/https only), `open_app` (known apps), `open_folder`, `open_file` (only inside your added folders), `media`, `lock`, `remind`, `disk` — v1.2 |
 | `GET /reminders`, `DELETE /reminders/{id}` | Pending reminders (they fire as a notification and land in the inbox) — v1.2 |
+| `GET /hotword`, `POST /hotword/config`, `GET /wake/next` | "Hey Jarvis": status, on/off, sensitivity, pause; the request heard after the wake phrase, picked up by the visible Jarvis window — v1.3 |
+| `POST /speak`, `POST /speak/stop` | Play a reply through the PC's speakers (used when a window opened by "Hey Jarvis" isn't allowed to play sound yet) — v1.3 |
+| `POST /autostart` | Start the Companion with Windows (per-user Run key, else a Startup-folder script) — v1.3 |
 | `GET /voice`, `POST /voice/config`, `POST /stt`, `POST /tts` | Offline voice status and settings, speech to text (16 kHz WAV in), text to speech (WAV out) — v1.2 |
 
 Scheduled tasks call your local Ollama model, optionally after a web search. Results are stored in a local SQLite database, `jarvis.db`. If the PC was off at the scheduled time, the task runs once when the Companion next starts. When a task finishes, the Companion shows a desktop notification (Windows toast, macOS Notification Center, or `notify-send` on Linux); clicking it opens the result in the HUD. Turn this off in **SETUP → COMPANION**.
@@ -406,6 +410,8 @@ Click the **paperclip**, drag files onto the conversation, or paste an image. Su
 | MY FOLDERS stays on "Reading…" | Large folders take a while the first time (embedding runs through Ollama) | Leave it running; it continues in the background and re-checks every 30 minutes |
 | "PC actions need Jarvis Companion 1.2" | Older Companion | Re-run the Companion install command |
 | Offline voice setup fails at "Installing Python packages" | pip couldn't download or build a package | Check internet access, then see `%LOCALAPPDATA%\JarvisCompanion\companion.log`; run `py -m pip install --user faster-whisper piper-tts` to see the full error |
+| "Hey Jarvis" does nothing | Companion not running, add-on not set up, or the mic is blocked for desktop apps | **CONFIG → VOICE** shows the status. Windows: **Settings → Privacy & security → Microphone → Let desktop apps access your microphone**. Try sensitivity **High** |
+| Jarvis wakes up by itself | Similar-sounding words or TV audio | Set sensitivity to **Low**, or **PAUSE FOR 1 HOUR** |
 | VITALS shows no CPU / GPU | Companion missing or older than 1.1 | Re-run the Companion install command |
 | VITALS says **100% CPU** | The model doesn't fit on the graphics card, or there's no NVIDIA GPU | Use a smaller model or lower **Max context**; update your NVIDIA driver |
 | No desktop notification | Windows notifications or Focus is off | **Settings → System → Notifications**: turn on notifications (and for Windows PowerShell); use **SEND TEST NOTIFICATION** |
@@ -436,6 +442,7 @@ ollama ps                                        # loaded models, and CPU vs GPU
 - **Vitals** are read locally by the Companion and sent only to your browser.
 - **Folder search** reads only the folders you add (system folders and whole drives are refused). The index (text snippets and embeddings) is stored in the Companion's `jarvis.db` on your PC; remove a folder to delete its index.
 - **PC actions** are a fixed list in the Companion. Websites open only for `http`/`https` addresses, files only inside your added folders, and there is no "run command", delete or shutdown action.
+- **"Hey Jarvis":** the Companion keeps the microphone open while it's on and checks 80 ms slices of sound for the phrase, in memory. Nothing is saved or sent; only after the phrase does it record your request (until you stop talking) and transcribe it on your PC. Pause it or switch it off in **CONFIG → VOICE**.
 - **Offline voice:** with *Use offline speech recognition* on, microphone audio is recorded in the browser and sent only to the Companion on `127.0.0.1`; nothing goes to Google or Microsoft.
 - **Spoken replies** use voices installed on your device.
 - **Web search (OpenJarvis mode):** when the agent searches, the search query goes to a web search provider. The AI model itself stays local.
@@ -535,6 +542,7 @@ jarvis-hud/
         ├── Vitals.jsx         # Ring gauges + VITALS panel (CPU, RAM, GPU, VRAM, model placement)
         ├── Folders.jsx        # WORKSPACE → MY FOLDERS: add folders, set up and watch indexing
         ├── VoiceSetup.jsx     # CONFIG → VOICE: offline Whisper + Piper setup
+        ├── HeyJarvisSetup.jsx # CONFIG → VOICE: "Hey Jarvis" (Companion), sensitivity, start with Windows
         └── Settings.jsx       # SETUP / COMPANION / LINK / PERSONA / VOICE modal
 ```
 

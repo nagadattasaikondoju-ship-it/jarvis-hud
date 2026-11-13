@@ -124,6 +124,7 @@ export default function App() {
   const [folderInfo, setFolderInfo] = useState(null);
   const [vstat, setVstat] = useState(null);
   const [transcribing, setTranscribing] = useState(false);
+  const [hotStat, setHotStat] = useState(null);
   const install = useInstall();
 
   const abortRef = useRef(null);
@@ -142,6 +143,8 @@ export default function App() {
   const micVoiceRef = useRef(false);
   const onWakeRef = useRef(null);
   const pendingRun = useRef(null);
+  const wokeAt = useRef(0);
+  const pcSpeaking = useRef(false);
   const clock = useClock();
 
   const setCfg = (c) => { setCfgState(c); save('ojh.cfg', c); };
@@ -163,6 +166,7 @@ export default function App() {
       const m = q.get('mode');
       if (m && MODES.some((x) => x.id === m)) setMode(m);
       pendingRun.current = q.get('run');
+      if (q.get('wake')) wokeAt.current = Date.now(); // opened by “Hey Jarvis”
       if ([...q.keys()].length) window.history.replaceState(null, '', window.location.pathname);
     } catch { /* ignore */ }
   }, []);
@@ -392,6 +396,34 @@ export default function App() {
     if (!compHasVoice) { setVstat(null); return; }
     companion.voice(cfg).then(setVstat).catch(() => setVstat(null));
   }, [compHasVoice, comp.version]); // eslint-disable-line
+  const compHasHotword = companionHas(comp, 'hotword');
+  useEffect(() => {
+    if (!compHasHotword) { setHotStat(null); return undefined; }
+    const pull = () => companion.hotword(cfg).then(setHotStat).catch(() => {});
+    pull();
+    const i = setInterval(pull, 15000);
+    return () => clearInterval(i);
+  }, [compHasHotword, comp.version]); // eslint-disable-line
+  const hotwordOn = !!hotStat?.ready && !!hotStat?.enabled;
+  // Requests heard after “Hey Jarvis” arrive from the Companion. Only a visible window (or one just
+  // opened by the wake phrase) takes them, so a forgotten background tab doesn't answer.
+  useEffect(() => {
+    if (!hotwordOn) return undefined;
+    let live = true;
+    const i = setInterval(async () => {
+      const fresh = Date.now() - wokeAt.current < 90000;
+      if (document.visibilityState !== 'visible' && !fresh) return;
+      try {
+        const { command } = await companion.wakeNext(cfg);
+        if (!live || !command) return;
+        wokeAt.current = 0;
+        if (command.text) { voiceTurnRef.current = true; sendRef.current?.(command.text); }
+        else if (command.needs_mic) { micVoiceRef.current = true; startMicRef.current?.(); }
+        else pushSys('I heard “Hey Jarvis” but not the request after it. Say it again, or type here.', 'ok');
+      } catch { /* Companion busy or restarting */ }
+    }, 1000);
+    return () => { live = false; clearInterval(i); };
+  }, [hotwordOn, cfg]); // eslint-disable-line
   const voiceInstalled = !!vstat?.packages && !!vstat?.stt_ready;
   const useLocalStt = !!cfg.localStt && compHasVoice && voiceInstalled;
   const useLocalTts = !!cfg.localTts && compHasVoice && !!vstat?.packages && !!vstat?.voices?.some((v) => v.installed);
@@ -430,6 +462,21 @@ export default function App() {
 
   const speak = useCallback((text, after) => {
     if (!text) { after?.(); return; }
+    // A window opened by “Hey Jarvis” hasn't been clicked, so the browser won't play sound yet:
+    // let the Companion speak through the PC's speakers instead.
+    const noActivation = navigator.userActivation && !navigator.userActivation.hasBeenActive;
+    if (noActivation && compHasVoice && vstat?.voices?.some((v) => v.installed)) {
+      pcSpeaking.current = true;
+      setSpeaking(true);
+      levelRef.current = 0.6;
+      companion.speakPc(cfg, stripMd(text).slice(0, 2500)).catch(() => {}).finally(() => {
+        pcSpeaking.current = false;
+        setSpeaking(false);
+        levelRef.current = 0;
+        after?.();
+      });
+      return;
+    }
     if (!useLocalTts) { speakBrowser(text, after); return; }
     ttsRef.current?.stop();
     let started = false;
@@ -445,11 +492,12 @@ export default function App() {
       if (err instanceof Error && !started) speakBrowser(text, after); // offline voice failed: fall back to the browser voice
       else after?.();
     });
-  }, [useLocalTts, speakBrowser, cfg]);
+  }, [useLocalTts, speakBrowser, cfg, compHasVoice, vstat]);
 
   const hush = () => {
     try { window.speechSynthesis.cancel(); } catch { /* none */ }
     const t = ttsRef.current; ttsRef.current = null; t?.stop();
+    if (pcSpeaking.current) { pcSpeaking.current = false; companion.speakStop(cfg).catch(() => {}); }
     setSpeaking(false);
   };
 
@@ -872,7 +920,7 @@ export default function App() {
     setWake(w);
     return () => w.stop();
   }, [cfg.wakeWord, speechLocal, useLocalStt]); // eslint-disable-line
-  const wakeWanted = !!wake && booted && !listening && !busy && !speaking && !convo && !wakePaused && !transcribing;
+  const wakeWanted = !!wake && !hotwordOn && booted && !listening && !busy && !speaking && !convo && !wakePaused && !transcribing;
   useEffect(() => {
     if (!wake) return undefined;
     if (!wakeWanted) { wake.stop(); return undefined; }
@@ -1268,6 +1316,7 @@ export default function App() {
             ) : null}
             <Row k="Voice" v={(pickVoice()?.name || 'system').slice(0, 22)} />
             <Row k="Mic" v={SR ? (listening ? 'LIVE' : wakeState === 'armed' ? 'WAKE WORD' : 'READY') : 'UNSUPPORTED'} tone={listening || wakeState === 'armed' ? 'ok' : undefined} />
+            {hotwordOn ? <Row k="“Hey Jarvis”" v={hotStat.state === 'listening' ? 'ALWAYS ON' : (hotStat.state || '').toUpperCase()} tone={hotStat.state === 'listening' ? 'ok' : undefined} /> : null}
             <Row k="Speech" v={useLocalStt ? 'WHISPER · THIS PC' : !SR ? '—' : speechLocal === 'available' ? 'ON THIS PC' : 'BROWSER SERVICE'} tone={useLocalStt ? 'ok' : undefined} />
             {useLocalTts ? <Row k="Reply voice" v={(vstat?.tts_voice || '').replace(/-medium$/, '').toUpperCase()} tone="ok" /> : null}
           </Panel>
@@ -1315,6 +1364,7 @@ export default function App() {
         setSpeechLocal={setSpeechLocal}
         brainPair={brainPair}
         onVoiceStatus={setVstat}
+        onHotwordStatus={setHotStat}
       />
       <ArtifactPanel artifact={artifact} onClose={() => setArtifact(null)} />
     </div>

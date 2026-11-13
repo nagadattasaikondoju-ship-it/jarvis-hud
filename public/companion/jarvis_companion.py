@@ -10,12 +10,14 @@ Jarvis Companion - a small local helper for the OpenJarvis HUD.
   * Optional add-ons, installed only when you click SET UP in the HUD:
       - Folder search: indexes folders you choose, with a small local embedding model.
       - Offline voice: Whisper speech recognition and Piper voices, all on this PC.
+      - "Hey Jarvis": an always-on wake phrase that opens Jarvis even with no window open.
   * A fixed list of safe PC actions (open an app or website, media keys, reminders, disk report).
 
 Standard library only (no pip installs). Listens on 127.0.0.1:8765 only, and
 only answers the HUD's own web address (CORS) plus requests carrying X-Jarvis.
 """
 import base64
+import collections
 import json
 import os
 import platform
@@ -34,8 +36,8 @@ from datetime import datetime, timedelta
 from xml.sax.saxutils import escape as xml_escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.2.0"
-FEATURES = ["search", "tasks", "system", "notify", "folders", "actions", "voice"]
+VERSION = "1.3.0"
+FEATURES = ["search", "tasks", "system", "notify", "folders", "actions", "voice", "hotword"]
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("JARVIS_COMPANION_PORT", "8765"))
 ALLOWED_ORIGINS = {
@@ -67,6 +69,10 @@ DEFAULT_CFG = {
     "stt_model": "small",
     "stt_language": "",
     "tts_voice": "en_GB-alan-medium",
+    "hotword_enabled": False,
+    "hotword_sensitivity": "normal",
+    "hotword_paused_until": 0,
+    "hotword_browser": "auto",
 }
 IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
@@ -584,6 +590,7 @@ def scheduler_loop():
 EXTRAS = {
     "folders": ["pypdf>=4,<8", "numpy>=1.24"],
     "voice": ["faster-whisper>=1.1,<2", "piper-tts>=1.3,<2", "numpy>=1.24"],
+    "wake": ["onnxruntime>=1.16,<2", "numpy>=1.24", "sounddevice>=0.4.6,<1"],
 }
 EMBED_MODEL = "nomic-embed-text"
 WHISPER_FILES = ["config.json", "model.bin", "tokenizer.json", "vocabulary.txt"]
@@ -723,7 +730,8 @@ def fetch_voice(vid, job=None):
 def run_extra(name, opts):
     try:
         job_update(name, state="running", step="Installing Python packages (a few minutes)…", detail="", progress=None, error="")
-        module_of = {"pypdf": "pypdf", "numpy": "numpy", "faster-whisper": "faster_whisper", "piper-tts": "piper"}
+        module_of = {"pypdf": "pypdf", "numpy": "numpy", "faster-whisper": "faster_whisper", "piper-tts": "piper",
+                     "onnxruntime": "onnxruntime", "sounddevice": "sounddevice"}
         missing = [p for p in EXTRAS[name] if not have(module_of[p.split(">")[0].split("<")[0].split("=")[0]])]
         if missing:
             pip_install(missing)
@@ -732,6 +740,14 @@ def run_extra(name, opts):
                 job_update(name, step="Downloading the AI search model (about 275 MB)…", progress=0)
                 ollama_pull(EMBED_MODEL, name)
             FOLDERS.wake()
+        elif name == "wake":
+            for i, (f, url) in enumerate(HOTWORD_FILES.items()):
+                job_update(name, step=f"Downloading the “Hey Jarvis” model ({i + 1}/3)…", progress=i / 3)
+                download(url, os.path.join(HOTWORD_DIR, f), name, f)
+            cfg = load_cfg()
+            cfg["hotword_enabled"] = True
+            save_cfg(cfg)
+            HOTWORD.ensure()
         else:
             size = opts.get("stt_model") if opts.get("stt_model") in WHISPER_SIZES else load_cfg().get("stt_model", "small")
             if not whisper_ready(size):
@@ -1326,6 +1342,479 @@ def due_reminders():
             site = (load_cfg().get("site_url") or DEFAULT_CFG["site_url"]).rstrip("/")
             notify("⏰ Reminder", r["text"], f"{site}/?run={rid}")
 
+# ------------------------------------------------------------ "Hey Jarvis"
+# Always-on wake phrase, handled here so it works with no browser window open.
+# Detection uses openWakeWord's ONNX models (Apache-2.0): a mel spectrogram, a speech
+# embedding and the "hey jarvis" classifier. Audio is processed in memory and never stored.
+HOTWORD_FILES = {
+    "melspectrogram.onnx": "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/melspectrogram.onnx",
+    "embedding_model.onnx": "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/embedding_model.onnx",
+    "hey_jarvis_v0.1.onnx": "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/hey_jarvis_v0.1.onnx",
+}
+HOTWORD_DIR = os.path.join(MODELS_DIR, "hotword")
+SENSITIVITY = {"low": 0.75, "normal": 0.5, "high": 0.3}  # score needed to wake up
+
+
+def hotword_models_ready():
+    return all(os.path.exists(os.path.join(HOTWORD_DIR, f)) for f in HOTWORD_FILES)
+
+
+class HeyJarvisDetector:
+    FRAME = 1280  # 80 ms at 16 kHz
+
+    def __init__(self):
+        import numpy as np
+        import onnxruntime as ort
+        self.np = np
+        so = ort.SessionOptions()
+        so.inter_op_num_threads = 1
+        so.intra_op_num_threads = 1
+        load = lambda f: ort.InferenceSession(os.path.join(HOTWORD_DIR, f), sess_options=so, providers=["CPUExecutionProvider"])  # noqa: E731
+        self.mel, self.emb, self.ww = load("melspectrogram.onnx"), load("embedding_model.onnx"), load("hey_jarvis_v0.1.onnx")
+        self.mel_in, self.emb_in, self.ww_in = self.mel.get_inputs()[0].name, self.emb.get_inputs()[0].name, self.ww.get_inputs()[0].name
+        self.reset()
+
+    def _melspec(self, pcm):
+        spec = self.np.squeeze(self.mel.run(None, {self.mel_in: pcm.astype(self.np.float32)[None, :]})[0])
+        return spec / 10 + 2
+
+    def _embed(self, mel76):
+        return self.emb.run(None, {self.emb_in: mel76.astype(self.np.float32)[None, :, :, None]})[0].reshape(1, -1)
+
+    def reset(self):
+        np = self.np
+        self.raw = np.zeros(0, dtype=np.int16)
+        self.mel_buf = np.ones((76, 32), dtype=np.float32)
+        self.pending = np.zeros(0, dtype=np.int16)
+        spec = self._melspec(np.random.randint(-1000, 1000, 16000 * 4).astype(np.int16))
+        self.feat_buf = np.vstack([self._embed(spec[i:i + 76]) for i in range(0, spec.shape[0] - 75, 8)])
+        self.frames = 0
+
+    def process(self, pcm):
+        """Feed 16 kHz mono int16 audio; returns the highest wake score (0..1) in it."""
+        np = self.np
+        x = np.concatenate([self.pending, pcm.astype(np.int16)])
+        best = 0.0
+        while len(x) >= self.FRAME:
+            chunk, x = x[:self.FRAME], x[self.FRAME:]
+            self.raw = np.concatenate([self.raw, chunk])[-(self.FRAME + 480):]
+            if len(self.raw) < self.FRAME + 480:
+                continue
+            self.mel_buf = np.vstack([self.mel_buf, self._melspec(self.raw)])[-970:]
+            self.feat_buf = np.vstack([self.feat_buf, self._embed(self.mel_buf[-76:])])[-120:]
+            self.frames += 1
+            score = float(self.ww.run(None, {self.ww_in: self.feat_buf[-16:][None, :, :].astype(np.float32)})[0].reshape(-1)[0])
+            if self.frames > 5:
+                best = max(best, score)
+        self.pending = x
+        return best
+
+
+class MicSource:
+    """16 kHz mono int16 frames from the default microphone (or a WAV file for testing)."""
+
+    def __init__(self):
+        import queue
+        self.q = queue.Queue(maxsize=400)
+        self.stream = None
+        self.test_wav = os.environ.get("JARVIS_HOTWORD_WAV")
+
+    def __enter__(self):
+        if self.test_wav:
+            threading.Thread(target=self._feed_file, daemon=True).start()
+            return self
+        import sounddevice as sd
+        self.stream = sd.InputStream(samplerate=16000, channels=1, dtype="int16", blocksize=1280,
+                                     callback=lambda data, frames, t, status: self._put(data[:, 0].copy()))
+        self.stream.start()
+        return self
+
+    def _put(self, frame):
+        try:
+            self.q.put_nowait(frame)
+        except Exception:  # queue full: drop the oldest audio
+            try:
+                self.q.get_nowait()
+                self.q.put_nowait(frame)
+            except Exception:
+                pass
+
+    def _feed_file(self):
+        import wave
+        import numpy as np
+        with wave.open(self.test_wav, "rb") as w:
+            pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+        while not getattr(self, "closed", False):
+            for i in range(0, len(pcm) - 1280, 1280):
+                if getattr(self, "closed", False):
+                    return
+                self._put(pcm[i:i + 1280].copy())
+                time.sleep(0.08)
+
+    def read(self, timeout=2.0):
+        return self.q.get(timeout=timeout)
+
+    def flush(self):
+        while not self.q.empty():
+            try:
+                self.q.get_nowait()
+            except Exception:
+                break
+
+    def __exit__(self, *exc):
+        self.closed = True
+        if self.stream is not None:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+
+
+def play_wav(data):
+    """Play WAV bytes on this PC's speakers and wait until it finishes."""
+    try:
+        if IS_WIN:
+            import winsound
+            winsound.PlaySound(data, winsound.SND_MEMORY | winsound.SND_NODEFAULT)
+            return True
+        player = shutil.which("afplay") if IS_MAC else (shutil.which("paplay") or shutil.which("aplay"))
+        if not player:
+            return False
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            f.write(data)
+            name = f.name
+        subprocess.run([player, name], capture_output=True, timeout=180)
+        os.remove(name)
+        return True
+    except Exception:
+        log("play_wav failed", traceback.format_exc())
+        return False
+
+
+def stop_audio():
+    if IS_WIN:
+        try:
+            import winsound
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
+
+
+def beep():
+    if IS_WIN:
+        try:
+            import winsound
+            winsound.Beep(880, 90)
+            winsound.Beep(1320, 110)
+        except Exception:
+            pass
+
+
+def pcm_to_wav(pcm):
+    import io
+    import wave
+    b = io.BytesIO()
+    with wave.open(b, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(pcm.astype("int16").tobytes())
+    return b.getvalue()
+
+
+# --- opening the dashboard window ---------------------------------------------------------
+def _find_hud_window():
+    if not IS_WIN:
+        return None
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    found = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def cb(hwnd, _):
+        if user32.IsWindowVisible(hwnd):
+            n = user32.GetWindowTextLengthW(hwnd)
+            if n:
+                buf = ctypes.create_unicode_buffer(n + 1)
+                user32.GetWindowTextW(hwnd, buf, n + 1)
+                if "OpenJarvis HUD" in buf.value:
+                    found.append(hwnd)
+        return True
+
+    user32.EnumWindows(cb, 0)
+    return found[0] if found else None
+
+
+def _focus_window(hwnd):
+    import ctypes
+    user32 = ctypes.windll.user32
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    user32.keybd_event(0x12, 0, 0, 0)  # a quick ALT tap lets a background program bring a window to the front
+    user32.keybd_event(0x12, 0, 2, 0)
+    user32.SetForegroundWindow(hwnd)
+
+
+def _browser_exe(pref="auto"):
+    if not IS_WIN:
+        return None
+    import winreg
+    names = {"chrome": ["chrome.exe"], "edge": ["msedge.exe"]}.get(pref, ["chrome.exe", "msedge.exe"])
+    for name in names:
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            try:
+                with winreg.OpenKey(hive, rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{name}") as k:
+                    p = (winreg.QueryValue(k, None) or "").strip('"')
+                    if p and os.path.exists(p):
+                        return p
+            except OSError:
+                pass
+    return None
+
+
+def show_hud():
+    """Bring an open Jarvis window to the front, or open a new app-style window."""
+    cfg = load_cfg()
+    url = (cfg.get("site_url") or DEFAULT_CFG["site_url"]).rstrip("/") + "/?wake=1"
+    try:
+        hwnd = _find_hud_window()
+        if hwnd:
+            _focus_window(hwnd)
+            return "focused"
+        exe = _browser_exe(cfg.get("hotword_browser", "auto"))
+        if exe:
+            subprocess.Popen([exe, f"--app={url}"])
+            return "opened"
+        import webbrowser
+        webbrowser.open(url)
+        return "opened"
+    except Exception:
+        log("show_hud failed", traceback.format_exc())
+        return "failed"
+
+
+class Hotword:
+    def __init__(self):
+        self.state = "off"
+        self.error = ""
+        self.last_trigger = None
+        self.last_score = 0.0
+        self.triggers = 0
+        self.cmds = collections.deque(maxlen=5)
+        self.thread = None
+        self.lock = threading.Lock()
+        self.ambient = 300.0  # background loudness, measured while nobody is waking Jarvis
+
+    def ready(self):
+        return have("onnxruntime") and have("numpy") and (have("sounddevice") or bool(os.environ.get("JARVIS_HOTWORD_WAV"))) and hotword_models_ready()
+
+    def enabled(self):
+        cfg = load_cfg()
+        return bool(cfg.get("hotword_enabled")) and time.time() >= float(cfg.get("hotword_paused_until") or 0)
+
+    def status(self):
+        cfg = load_cfg()
+        return {
+            "ready": self.ready(), "enabled": bool(cfg.get("hotword_enabled")), "state": self.state, "error": self.error,
+            "sensitivity": cfg.get("hotword_sensitivity", "normal"), "paused_until": cfg.get("hotword_paused_until") or 0,
+            "last_trigger": self.last_trigger, "triggers": self.triggers, "browser": cfg.get("hotword_browser", "auto"),
+            "stt_ready": have("faster_whisper") and whisper_ready(cfg.get("stt_model", "small")),
+            "tts_ready": have("piper") and any(voice_ready(v) for v in VOICE_IDS),
+            "autostart": autostart_status(), "job": JOBS.get("wake", {"state": "idle"}),
+        }
+
+    def ensure(self):
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                return
+            if not load_cfg().get("hotword_enabled") or not self.ready():
+                self.state = "off" if self.ready() else "not set up"
+                return
+            self.thread = threading.Thread(target=self.run, daemon=True)
+            self.thread.start()
+
+    def run(self):
+        import numpy as np
+        try:
+            det = HeyJarvisDetector()
+        except Exception as e:  # noqa: BLE001
+            self.state, self.error = "error", f"Could not load the wake model: {e}"
+            log("hotword load failed", traceback.format_exc())
+            return
+        threading.Thread(target=self.warm_up, daemon=True).start()
+        while load_cfg().get("hotword_enabled"):
+            if not self.enabled():  # paused
+                self.state = "paused"
+                time.sleep(5)
+                continue
+            try:
+                with MicSource() as mic:
+                    self.state, self.error = "listening", ""
+                    det.reset()
+                    while self.enabled():
+                        try:
+                            frame = mic.read()
+                        except Exception:
+                            continue
+                        score = det.process(frame)
+                        self.last_score = max(score, self.last_score * 0.98)
+                        if score < 0.1:
+                            rms = float(np.sqrt(np.mean(frame.astype(np.float32) ** 2)))
+                            self.ambient = self.ambient * 0.98 + min(rms, 3000.0) * 0.02
+                        threshold = SENSITIVITY.get(load_cfg().get("hotword_sensitivity", "normal"), 0.5)
+                        if score >= threshold and (not self.last_trigger or time.time() - self.last_trigger > 3):
+                            self.on_wake(mic)
+                            det.reset()
+                            mic.flush()
+                            self.state = "listening"
+            except Exception as e:  # noqa: BLE001  (no microphone, device unplugged, …)
+                self.state, self.error = "error", f"Microphone problem: {e}"
+                log("hotword mic error", traceback.format_exc())
+                time.sleep(10)
+        self.state = "off"
+        _ = np
+
+    def on_wake(self, mic):
+        self.last_trigger = time.time()
+        self.triggers += 1
+        self.state = "awake"
+        log("hey jarvis heard")
+        cfg = load_cfg()
+        opened = {"how": ""}
+        t = threading.Thread(target=lambda: opened.update(how=show_hud()), daemon=True)
+        t.start()
+        # "Yes?" — the offline voice if installed, else a short chime
+        spoke = False
+        if have("piper"):
+            try:
+                spoke = play_wav(VOICE.speak("Yes?", cfg.get("tts_voice")))
+            except Exception:
+                spoke = False
+        if not spoke:
+            beep()
+        mic.flush()  # don't transcribe our own "Yes?"
+        text = ""
+        if have("faster_whisper") and whisper_ready(cfg.get("stt_model", "small")):
+            self.state = "recording"
+            pcm = self.record_phrase(mic)
+            log("hotword phrase", "none" if pcm is None else f"{len(pcm) / 16000:.1f}s")
+            if pcm is not None:
+                self.state = "transcribing"
+                try:
+                    text = VOICE.transcribe(pcm_to_wav(pcm)).get("text", "").strip()
+                except Exception:
+                    log("hotword stt failed", traceback.format_exc())
+        t.join(timeout=5)
+        self.cmds.append({"id": uuid.uuid4().hex[:10], "text": text, "ts": time.time(), "window": opened["how"],
+                          "needs_mic": not text and not (have("faster_whisper") and whisper_ready(cfg.get("stt_model", "small")))})
+
+    def warm_up(self):
+        """Load the voice and speech models now, so "Yes?" and the transcription are quick later."""
+        cfg = load_cfg()
+        try:
+            if have("piper"):
+                VOICE.speak("Yes?", cfg.get("tts_voice"))
+            if have("faster_whisper") and whisper_ready(cfg.get("stt_model", "small")):
+                import numpy as np
+                VOICE.transcribe(pcm_to_wav(np.zeros(16000, dtype=np.int16)), quick=True)
+        except Exception:
+            log("hotword warm-up", traceback.format_exc())
+
+    def record_phrase(self, mic, wait_s=6.0, silence_s=1.0, max_s=15.0):
+        import numpy as np
+        chunks, pre = [], []
+        noise = min(max(self.ambient, 120.0), 1500.0)  # measured before the wake word, while it was quiet
+        started, loud_run, quiet = False, 0, 0
+        t0 = time.time()
+        while time.time() - t0 < wait_s + max_s:
+            try:
+                f = mic.read(timeout=1.0)
+            except Exception:
+                continue
+            rms = float(np.sqrt(np.mean(f.astype(np.float32) ** 2)))
+            thr = max(450.0, noise * 3)
+            if not started:
+                pre = (pre + [f])[-4:]
+                loud_run = loud_run + 1 if rms > thr else 0
+                if loud_run >= 2:
+                    started, chunks = True, list(pre)
+                elif time.time() - t0 > wait_s:
+                    return None
+                continue
+            chunks.append(f)
+            quiet = 0 if rms > thr * 0.8 else quiet + 1
+            if quiet * 0.08 >= silence_s or len(chunks) * 0.08 >= max_s:
+                break
+        return np.concatenate(chunks) if chunks else None
+
+    def next_command(self):
+        while self.cmds:
+            c = self.cmds.popleft()
+            if time.time() - c["ts"] < 90:
+                return c
+        return None
+
+
+HOTWORD = Hotword()
+SPEAK_LOCK = threading.Lock()
+
+
+# --- start with Windows -------------------------------------------------------------------
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def _pythonw():
+    exe = sys.executable
+    if IS_WIN and exe.lower().endswith("python.exe"):
+        cand = exe[:-len("python.exe")] + "pythonw.exe"
+        if os.path.exists(cand):
+            return cand
+    return exe
+
+
+def _startup_vbs():
+    return os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "Jarvis Companion.vbs")
+
+
+def autostart_status():
+    if not IS_WIN:
+        return "unsupported"
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            winreg.QueryValueEx(k, "JarvisCompanion")
+            return "on"
+    except OSError:
+        pass
+    startup = os.path.join(os.path.dirname(_startup_vbs()), "Jarvis Companion.lnk")
+    return "on" if os.path.exists(_startup_vbs()) or os.path.exists(startup) else "off"
+
+
+def set_autostart():
+    """Start the Companion when you sign in to Windows. Tries the per-user Run key, then the Startup folder."""
+    if not IS_WIN:
+        raise ValueError("Automatic start is set up by the installer only on Windows.")
+    script = os.path.abspath(__file__)
+    cmd = f'"{_pythonw()}" "{script}"'
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, "JarvisCompanion", 0, winreg.REG_SZ, cmd)
+        return "Jarvis Companion will start every time you sign in (Run key)."
+    except OSError as e:
+        log("run key blocked", e)
+    try:
+        vbs = 'CreateObject("WScript.Shell").Run """' + _pythonw() + '"" ""' + script + '""", 0, False\r\n'
+        with open(_startup_vbs(), "w", encoding="utf-8") as f:
+            f.write(vbs)
+        return "Jarvis Companion will start every time you sign in (Startup folder)."
+    except OSError as e:
+        log("startup folder blocked", e)
+    raise RuntimeError("Windows security blocked automatic start. Use the manual steps shown below the button.")
+
 # --------------------------------------------------------------------- http
 class Handler(BaseHTTPRequestHandler):
     server_version = "JarvisCompanion/" + VERSION
@@ -1416,6 +1905,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/folders":
                 return self._send(200, {"folders": FOLDERS.stats(), "index": FOLDERS.status, "ready": FOLDERS.ready(),
                                         "suggestions": default_folders(), "job": JOBS.get("folders", {"state": "idle"})})
+            if path == "/hotword":
+                return self._send(200, HOTWORD.status())
+            if path == "/wake/next":
+                return self._send(200, {"command": HOTWORD.next_command()})
             if path == "/reminders":
                 with db() as con:
                     rows = [dict(r) for r in con.execute("SELECT * FROM reminders WHERE done=0 ORDER BY at")]
@@ -1467,6 +1960,34 @@ class Handler(BaseHTTPRequestHandler):
                     opts["voices"] = [v for v in body["voices"] if v in VOICE_IDS][:4]
                 start_extra(name, opts)
                 return self._send(200, {"ok": True})
+            if path == "/hotword/config":
+                cfg = load_cfg()
+                if isinstance(body.get("enabled"), bool):
+                    cfg["hotword_enabled"] = body["enabled"]
+                    cfg["hotword_paused_until"] = 0
+                if body.get("sensitivity") in SENSITIVITY:
+                    cfg["hotword_sensitivity"] = body["sensitivity"]
+                if body.get("browser") in ("auto", "chrome", "edge", "default"):
+                    cfg["hotword_browser"] = body["browser"]
+                if "pause_minutes" in body:
+                    m = max(0, min(int(body.get("pause_minutes") or 0), 24 * 60))
+                    cfg["hotword_paused_until"] = time.time() + m * 60 if m else 0
+                save_cfg(cfg)
+                HOTWORD.ensure()
+                return self._send(200, HOTWORD.status())
+            if path == "/speak":
+                text = str(body.get("text") or "").strip()[:2500]
+                if not text:
+                    return self._send(400, {"error": "Nothing to say"})
+                wav = VOICE.speak(text, body.get("voice"))
+                with SPEAK_LOCK:
+                    ok = play_wav(wav)
+                return self._send(200 if ok else 500, {"ok": ok} if ok else {"error": "This PC could not play the audio."})
+            if path == "/speak/stop":
+                stop_audio()
+                return self._send(200, {"ok": True})
+            if path == "/autostart":
+                return self._send(200, {"ok": True, "message": set_autostart(), "autostart": autostart_status()})
             if path == "/voice/config":
                 cfg = load_cfg()
                 if body.get("tts_voice") in VOICE_IDS:
@@ -1597,6 +2118,7 @@ def main():
     threading.Thread(target=scheduler_loop, daemon=True).start()
     threading.Thread(target=FOLDERS.loop, daemon=True).start()
     FOLDERS.wake()
+    HOTWORD.ensure()
     log(f"Jarvis Companion {VERSION} listening on http://{HOST}:{PORT} (data: {HOME})")
     print(f"Jarvis Companion {VERSION} running on http://{HOST}:{PORT}")
     server.serve_forever()
