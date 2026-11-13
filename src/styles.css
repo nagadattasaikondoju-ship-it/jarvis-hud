@@ -580,3 +580,4 @@ code { font-family: var(--f-mono); font-size: 0.86em; }
 .sources .src-open { margin-left: 8px; }
 .disk { width: 100%; border-collapse: collapse; font-size: 13px; }
 .voice-grid { display: grid; gap: 10px; }
+.codeblock { display: block; padding: 8px 10px; border: 1px solid var(--line); background: rgba(0, 0, 0, 0.3); word-break: break-all; font-size: 12px; margin-top: 6px; }

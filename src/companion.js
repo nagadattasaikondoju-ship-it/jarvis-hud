@@ -3,7 +3,7 @@
 // scheduled tasks in the background, even when the browser is closed.
 // Version 1.1+ also reports live system vitals and shows desktop notifications.
 
-export const COMPANION_LATEST = '1.2.0';
+export const COMPANION_LATEST = '1.3.0';
 export const companionHas = (comp, feature) => !!comp?.ok && Array.isArray(comp.features) && comp.features.includes(feature);
 
 const H = { 'Content-Type': 'application/json', 'X-Jarvis': '1' };
@@ -68,6 +68,13 @@ export const companion = {
     if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || `Voice failed (HTTP ${r.status})`); }
     return r.blob();
   },
+  hotword: (cfg) => call(cfg, '/hotword', {}, 5000),
+  hotwordConfig: (cfg, body) => call(cfg, '/hotword/config', { method: 'POST', body: JSON.stringify(body) }),
+  wakeNext: (cfg) => call(cfg, '/wake/next', {}, 3000),
+  /** Speak through this PC's speakers (works even when the page may not play sound). Resolves when finished. */
+  speakPc: (cfg, text) => call(cfg, '/speak', { method: 'POST', body: JSON.stringify({ text }) }, 180000),
+  speakStop: (cfg) => call(cfg, '/speak/stop', { method: 'POST', body: '{}' }),
+  autostart: (cfg) => call(cfg, '/autostart', { method: 'POST', body: '{}' }, 15000),
   markRead: (cfg, id) => call(cfg, `/runs/${encodeURIComponent(id)}/read`, { method: 'POST', body: '{}' }),
 };
 
