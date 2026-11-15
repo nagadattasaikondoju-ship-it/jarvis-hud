@@ -16,6 +16,7 @@ import { ACCEPT, attachmentBlock, readFile } from './files.js';
 import { MODES, DEFAULT_MODE_OPTS, WRITE_TYPES, TONES, LENGTHS, LANGUAGES, FILE_FORMATS, modeSystem, schemaFor } from './modes.js';
 import { companion, companionHas, sourcesBlock } from './companion.js';
 import { searchIntent, detectMode, detectAction } from './intent.js';
+import { SKILLS, skillById, SKILL_STOP } from './skills.js';
 import Folders from './components/Folders.jsx';
 import { recordUtterance, speakLocal, createLocalWake } from './localvoice.js';
 
@@ -34,7 +35,6 @@ const CHARS_PER_TOKEN = 3;
 const PROTOCOLS = [
   { id: 'status', label: 'STATUS REPORT', prompt: 'Give me a short status report: who you are, that you run locally, and three things you can help me with right now.' },
   { id: 'brief', label: 'BRIEF ME', prompt: 'Summarise our conversation so far in three short bullet points, then suggest one next step.' },
-  { id: 'plan', label: 'PLAN MY DAY', prompt: 'Help me plan my day. Ask me up to three quick questions first, then propose a schedule.' },
   { id: 'explain', label: 'EXPLAIN SIMPLY', prompt: 'Explain your last answer again in simpler words, with one everyday analogy.' },
 ];
 
@@ -125,6 +125,7 @@ export default function App() {
   const [vstat, setVstat] = useState(null);
   const [transcribing, setTranscribing] = useState(false);
   const [hotStat, setHotStat] = useState(null);
+  const [skillSession, setSkillSession] = useState(null); // { id, chatId } while a quiz or interview is running
   const install = useInstall();
 
   const abortRef = useRef(null);
@@ -138,6 +139,7 @@ export default function App() {
   const sendRef = useRef(null);
   const startMicRef = useRef(null);
   const voiceTurnRef = useRef(false);
+  const taRef = useRef(null);
   const ttsRef = useRef(null);
   const localRecRef = useRef(null);
   const micVoiceRef = useRef(false);
@@ -228,6 +230,7 @@ export default function App() {
     setChatId(id); save('ojh.chat', id);
     setMessages([]);
     setDrawer(false);
+    setSkillSession(null);
     return id;
   }, [projectId]);
 
@@ -569,20 +572,29 @@ export default function App() {
     }
 
     // PC actions: "open YouTube", "remind me at 6 pm to …", "what's taking up my disk?"
-    if ((useMode === 'auto' || (useMode === 'chat' && !opts.mode)) && !files.length) {
+    const inSkillSession = !!skillSession && skillSession.chatId === cid;
+    if ((useMode === 'auto' || (useMode === 'chat' && !opts.mode)) && !files.length && !inSkillSession) {
       const act = detectAction(q);
       if (act) { runPcAction(q, act); return; }
     }
 
-    // AUTO: work out the tool (and its options) from the message itself.
+    // A quiz or mock interview keeps going until you say stop (or click END).
     let mOpts = modeOpts;
+    let endSkill = false;
+    if (skillSession && skillSession.chatId === cid && !opts.mode && (useMode === 'auto' || useMode === 'chat') && !files.length) {
+      useMode = 'skill';
+      mOpts = { ...modeOpts, skill: skillSession.id };
+      endSkill = SKILL_STOP.test(q);
+    }
+
+    // AUTO: work out the tool (and its options) from the message itself.
     let autoPicked = false;
     let translateOnly = '';
     if (useMode === 'auto') {
       const d = detectMode(q, { files, hasFolders });
       translateOnly = d.text || '';
       useMode = d.mode;
-      mOpts = { ...modeOpts, ...d.opts };
+      mOpts = { ...mOpts, ...d.opts };
       autoPicked = true;
     }
 
@@ -622,9 +634,12 @@ export default function App() {
     const textAtts = files.filter((a) => a.kind !== 'image');
     const per = textAtts.length ? Math.floor((budget * 0.55) / textAtts.length) : 0;
     const images = files.filter((a) => a.kind === 'image').map((a) => a.image);
-    const sentText = [translateOnly ? `Translate into ${mOpts.language}:\n${translateOnly}` : q || (images.length ? 'Describe and analyse the attached image(s).' : 'Analyse the attached file(s).'), ...textAtts.map((a) => attachmentBlock(a, per))].join('\n\n');
+    const finishNote = endSkill ? skillById(mOpts.skill)?.finish : '';
+    const sentText = [finishNote || (translateOnly ? `Translate into ${mOpts.language}:\n${translateOnly}` : q || (images.length ? 'Describe and analyse the attached image(s).' : 'Analyse the attached file(s).')), ...textAtts.map((a) => attachmentBlock(a, per))].join('\n\n');
     const modeInfo = MODES.find((x) => x.id === useMode);
-    const baseLabel = useMode === 'chat' ? '' : useMode === 'write' ? `WRITE · ${mOpts.writeType} · ${mOpts.tone}` : useMode === 'translate' ? `TRANSLATE → ${mOpts.language}` : useMode === 'file' ? `CREATE · ${FILE_FORMATS.find((f) => f.id === mOpts.format)?.label}` : modeInfo?.label;
+    const skillDef = useMode === 'skill' ? skillById(mOpts.skill) : null;
+    if (skillDef?.interactive) setSkillSession(endSkill ? null : { id: skillDef.id, chatId: cid });
+    const baseLabel = useMode === 'chat' ? '' : skillDef ? `SKILL · ${skillDef.label.toUpperCase()}` : useMode === 'write' ? `WRITE · ${mOpts.writeType} · ${mOpts.tone}` : useMode === 'translate' ? `TRANSLATE → ${mOpts.language}` : useMode === 'file' ? `CREATE · ${FILE_FORMATS.find((f) => f.id === mOpts.format)?.label}` : modeInfo?.label;
     const modeLabel = autoResearch ? 'RESEARCH · AUTO' : autoPicked && baseLabel ? `AUTO → ${baseLabel}` : baseLabel;
     const userMsg = {
       id: uid(), role: 'user', content: q, ts: now(), modeLabel, sentText,
@@ -638,7 +653,7 @@ export default function App() {
     const patch = (p) => setMessages((ms) => ms.map((m) => (m.id === aiId ? { ...m, ...p } : m)));
     const addStep = (line) => setMessages((ms) => ms.map((m) => (m.id === aiId ? { ...m, steps: [...(m.steps || []), line] } : m)));
 
-    const model = pickModel(cfg, link, { mode: useMode, files: files.length > 0 || !!project?.fileIds?.length, length: q.length });
+    const model = pickModel(cfg, link, { mode: skillDef?.model === 'fast' ? 'chat' : useMode, files: files.length > 0 || !!project?.fileIds?.length, length: q.length });
     const voiceTurn = voiceTurnRef.current || !!opts.voice;
     voiceTurnRef.current = false;
     const ctl = new AbortController();
@@ -965,6 +980,7 @@ export default function App() {
     : autoGuess.mode === 'write' ? `WRITE · ${autoGuess.opts.writeType || modeOpts.writeType}`
     : autoGuess.mode === 'translate' ? `TRANSLATE → ${autoGuess.opts.language || modeOpts.language}`
     : autoGuess.mode === 'file' ? `CREATE · ${FILE_FORMATS.find((f) => f.id === autoGuess.opts.format)?.label.split(' ')[0]}`
+    : autoGuess.mode === 'skill' ? `SKILL · ${skillById(autoGuess.opts.skill)?.label}`
     : MODES.find((x) => x.id === autoGuess.mode)?.label || '';
   const toggleAuto = () => {
     const on = !cfg.autoMode;
@@ -972,6 +988,15 @@ export default function App() {
     setMode(on ? 'auto' : 'chat');
   };
   const pickMode = (id) => setMode(cfg.autoMode && mode === id ? 'auto' : id);
+  const pickSkill = (id) => {
+    if (mode === 'skill' && modeOpts.skill === id) { setMode(cfg.autoMode ? 'auto' : 'chat'); return; }
+    setModeOpts({ ...modeOpts, skill: id });
+    setMode('skill');
+    setDrawer(false);
+    setTimeout(() => taRef.current?.focus(), 50);
+  };
+  const activeSkill = mode === 'skill' ? skillById(modeOpts.skill) : null;
+  const sessionSkill = skillSession && skillSession.chatId === chatId ? skillById(skillSession.id) : null;
   const brain = cfg.mode === 'ollama' ? cfg.brain || 'manual' : 'manual';
   const brainPair = brainModels(cfg, link);
   const nextModel = pickModel(cfg, link, { mode: autoGuess ? autoGuess.mode : mode, files: atts.length > 0, length: input.length });
@@ -1052,6 +1077,8 @@ export default function App() {
     : mode === 'dashboard' ? 'Attach a spreadsheet/CSV or paste numbers, then describe the dashboard…'
     : mode === 'artifact' ? 'Describe a diagram, chart, calculator or mini app…'
     : mode === 'research' ? 'Ask a question to research on the web…'
+    : activeSkill ? activeSkill.placeholder
+    : sessionSkill ? `Your answer… (say “stop” to finish the ${sessionSkill.label.toLowerCase()})`
     : mode === 'auto' ? 'Ask anything — “make a ppt on…”, “translate to Telugu…”, “latest news on…”, or attach a file…'
     : 'Give an instruction, attach a file, or press the mic…';
 
@@ -1210,7 +1237,7 @@ export default function App() {
               <div className="modebar__opts autohint" aria-live="polite">
                 {mode === 'auto'
                   ? (guessLabel ? <>Jarvis will use <b>{guessLabel}</b></> : <>Jarvis picks the tool from your message</>)
-                  : <>Next message only: <b>{MODES.find((x) => x.id === mode)?.label}</b> <button className="linkbtn" onClick={() => setMode('auto')}>back to auto</button></>}
+                  : <>Next message only: <b>{activeSkill ? `SKILL · ${activeSkill.label}` : MODES.find((x) => x.id === mode)?.label}</b> <button className="linkbtn" onClick={() => setMode('auto')}>back to auto</button></>}
               </div>
             )}
             {mode === 'write' && (
@@ -1254,6 +1281,18 @@ export default function App() {
             )}
           </div>
 
+          {sessionSkill ? (
+            <div className="skillbar" role="status">
+              <span><i className="led" /> {sessionSkill.label} in progress — answer below</span>
+              <button className="btn btn--tiny btn--ghost" onClick={() => send('stop')} disabled={busy}>FINISH</button>
+              <button className="btn btn--tiny btn--ghost" onClick={() => setSkillSession(null)}>END</button>
+            </div>
+          ) : !cfg.autoMode && activeSkill ? (
+            <div className="skillbar" role="status">
+              <span>Skill: <b>{activeSkill.label}</b> — {activeSkill.hint}</span>
+              <button className="btn btn--tiny btn--ghost" onClick={() => setMode('chat')}>✕</button>
+            </div>
+          ) : null}
           {atts.length > 0 && (
             <div className="atts atts--pending">
               {atts.map((a) => (
@@ -1277,6 +1316,7 @@ export default function App() {
             </button>
             <input ref={fileInRef} type="file" multiple accept={ACCEPT} hidden onChange={(e) => { attach([...e.target.files]); e.target.value = ''; }} />
             <textarea
+              ref={taRef}
               rows={1}
               value={input}
               placeholder={placeholder}
@@ -1321,6 +1361,16 @@ export default function App() {
             {useLocalTts ? <Row k="Reply voice" v={(vstat?.tts_voice || '').replace(/-medium$/, '').toUpperCase()} tone="ok" /> : null}
           </Panel>
           <Scheduler cfg={cfg} online={comp.ok} onOpenRun={openRun} onSetup={() => setSettings({ open: true, tab: 'companion' })} onUnread={setUnread} />
+          <Panel title="SKILLS" code="SKL-07">
+            <div className="skills">
+              {SKILLS.map((k) => (
+                <button key={k.id} className={`skill ${activeSkill?.id === k.id || sessionSkill?.id === k.id ? 'skill--on' : ''}`} onClick={() => pickSkill(k.id)} title={k.hint} disabled={busy}>
+                  <i aria-hidden="true">{k.icon}</i><span>{k.label}</span>
+                </button>
+              ))}
+            </div>
+            <p className="muted small">{activeSkill ? activeSkill.hint : 'Pick one, then type or attach. In AUTO, Jarvis also picks these by itself.'}</p>
+          </Panel>
           <Panel title="PROTOCOLS" code="CMD-04">
             <div className="protos">
               {PROTOCOLS.map((p) => (

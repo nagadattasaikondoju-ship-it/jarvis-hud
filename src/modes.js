@@ -1,5 +1,6 @@
 // Jarvis modes: what each one tells the local model, and (for files/dashboards)
 // the exact JSON shape the model must return. Ollama enforces the shape.
+import { skillById } from './skills.js';
 
 export const MODES = [
   { id: 'chat', label: 'CHAT', hint: 'Talk normally' },
@@ -123,6 +124,8 @@ export function modeSystem(mode, o) {
       return 'ARTIFACT MODE. Build what the user asks for (diagram, chart, calculator, mini web app, interactive explainer) as ONE complete, self-contained HTML file with inline CSS and JavaScript. Use a dark, clean design. Do not use external images. If you need a library, load it only from https://cdn.jsdelivr.net. Reply with exactly one ```html code block, then one short sentence describing it.';
     case 'research':
       return 'RESEARCH MODE. Answer using ONLY the numbered web sources provided. Cite sources inline like [1], [2] right after the facts they support. Start with a 2-3 sentence direct answer, then key points as a list. If sources disagree or are insufficient, say so. Do not invent sources or URLs.';
+    case 'skill':
+      return skillById(o.skill)?.system || '';
     case 'files':
       return "MY FILES MODE. Answer using ONLY the numbered excerpts from the user's own files. Cite them inline like [1] and mention the file name when it helps. If the excerpts don't contain the answer, say so plainly and suggest what to search for instead. Never invent content.";
     default:
