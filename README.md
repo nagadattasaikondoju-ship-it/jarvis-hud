@@ -92,6 +92,7 @@ Most AI assistants send everything you type to a company's servers. This one doe
 | 🖱️ | **PC actions** | *"Open YouTube"*, *"open VS Code"*, *"play lofi on YouTube"*, *"volume up"*, *"pause"*, *"lock my PC"*, *"remind me at 6 pm to call mom"*, *"what's taking up my disk?"*. Only a fixed list of safe actions exists; nothing deletes files or runs typed commands |
 | 🎙️ | **"Hey Jarvis" with nothing open** | The Companion listens in the background (openWakeWord's ONNX models, on your PC). Say *"Hey Jarvis"* and it answers *"Yes?"*, opens or focuses the Jarvis window, hears your request (with offline voice) and Jarvis answers aloud. Sensitivity, pause and start-with-Windows in **CONFIG → VOICE** |
 | 🔇 | **Fully offline voice** | Optional: **Whisper** (speech to text) and **Piper** (natural voices, including Telugu, Hindi and Malayalam) run on your PC through the Companion, for the mic, conversation mode and the wake word. Set up in **CONFIG → VOICE** (~1 GB download) |
+| 🧩 | **Skills** | 12 focused skills in the **SKILLS** panel, written for small local models: *Explain code, Review my code, Fix an error, Summarise, Study helper, Quiz me, Interview prep, Plan my day, Reply to a message, Explain simply, Help me decide, Brainstorm*. AUTO picks them from your message ("review my code…", "quiz me on…"); *Quiz me* and *Interview prep* keep going one question at a time until you say stop |
 | 🪄 | **AUTO mode** | No need to pick a mode: Jarvis reads your message and chooses CREATE FILE (and the format), TRANSLATE (and the language), WRITE (type and tone), DASHBOARD, ARTIFACT, RESEARCH or CHAT, instantly. Click a mode button to force it for one message |
 | ⚡ | **Protocols** | One-click commands: Status Report, Brief Me, Plan My Day, Explain Simply, Run Diagnostics |
 | 🎭 | **Persona editor** | Change Jarvis's personality with your own system prompt |
@@ -343,7 +344,8 @@ Switch modes any time in **CONFIG → Link**.
 | "draw a flowchart of…", "build a BMI calculator", "create a quiz on…" | **ARTIFACT** |
 | "write an email to my manager…", "a funny poem about rain", "draft a short LinkedIn post…" | **WRITE** (type, tone and length detected) |
 | "latest news about ISRO", "search the web for…", "weather in Hyderabad today" | **RESEARCH** |
-| anything else, or "summarise this pdf" with a file attached | **CHAT** |
+| "review my code …", "I get this error: …", "quiz me on Python", "mock interview for a data analyst", "summarise this", "should I buy X or Y" | the matching **SKILL** |
+| anything else | **CHAT** |
 
 Detection uses fast built-in rules (no extra AI call, no delay). To force a tool for one message, click its button; it's highlighted, and AUTO comes back after you send. Switch **AUTO** off to choose modes yourself as before.
 
@@ -529,6 +531,7 @@ jarvis-hud/
     ├── companion.js       # Client for Jarvis Companion (search, tasks, inbox, vitals, notifications)
     ├── wake.js            # "Jarvis" wake word on top of the Web Speech API
     ├── intent.js          # AUTO mode: picks the tool, PC actions, web and file questions
+    ├── skills.js          # The 12 skills: prompts, matching rules, quiz/interview sessions
     ├── localvoice.js      # Offline voice: mic recording + VAD → WAV, Piper playback, offline wake word
     ├── pwa.js             # Service worker registration, install prompt, app badge
     └── components/

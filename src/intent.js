@@ -1,3 +1,4 @@
+import { detectSkill } from './skills.js';
 // Spots chat messages that need the web, so Jarvis can search automatically
 // instead of answering from (possibly outdated) training data.
 
@@ -125,6 +126,10 @@ export function detectMode(text, { files = [], hasFolders = false } = {}) {
 
   // 3b. Questions about the user's own files (when folders are indexed)
   if (hasFolders && !files.length && filesIntent(t)) return { mode: 'files', opts: {}, why: 'files' };
+
+  // 3c. Skills: explain/review/debug code, summarise, study, quiz, interview, plan, reply, decide, brainstorm…
+  const skill = detectSkill(t, { files });
+  if (skill) return { mode: 'skill', opts: { skill: skill.id }, why: skill.id };
 
   // 4. Artifacts: diagrams, calculators, mini apps, games
   if (near(String.raw`(make|create|generate|build|design|draw|code|develop|show|give|need|want|write)`,

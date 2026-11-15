@@ -581,3 +581,17 @@ code { font-family: var(--f-mono); font-size: 0.86em; }
 .disk { width: 100%; border-collapse: collapse; font-size: 13px; }
 .voice-grid { display: grid; gap: 10px; }
 .codeblock { display: block; padding: 8px 10px; border: 1px solid var(--line); background: rgba(0, 0, 0, 0.3); word-break: break-all; font-size: 12px; margin-top: 6px; }
+
+/* ---------- v6: skills ---------- */
+.skills { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
+.skill { display: flex; align-items: center; gap: 7px; padding: 7px 8px; border: 1px solid var(--line); background: rgba(63, 224, 255, 0.04); cursor: pointer; text-align: left; font-size: 13px; line-height: 1.15; transition: 0.15s; min-width: 0; }
+.skill i { font-style: normal; color: var(--cyan); width: 14px; text-align: center; flex-shrink: 0; }
+.skill span { overflow: hidden; text-overflow: ellipsis; }
+.skill:hover:not(:disabled) { border-color: var(--cyan); background: rgba(63, 224, 255, 0.12); }
+.skill--on { border-color: var(--ok); background: rgba(77, 255, 176, 0.1); color: var(--ok); }
+.skill--on i { color: var(--ok); }
+.skill:disabled { opacity: 0.45; cursor: default; }
+.skillbar { display: flex; align-items: center; gap: 8px; margin-top: 8px; padding: 6px 10px; border: 1px solid var(--ok); background: rgba(77, 255, 176, 0.06); font-size: 13px; color: var(--ok); flex-shrink: 0; }
+.skillbar span { flex: 1; min-width: 0; }
+.skillbar .led { display: inline-block; vertical-align: middle; margin-right: 4px; }
+.skillbar b { color: var(--ok); }
